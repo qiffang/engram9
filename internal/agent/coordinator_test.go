@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -89,6 +90,23 @@ func (store *fakeCoordinatorStore) WriteTombstone(eventID string) error {
 	delete(store.statuses, eventID)
 	store.pending[eventID] = PendingEvent{ID: eventID}
 	return nil
+}
+
+func (store *fakeCoordinatorStore) UnknownByReason() map[string]int {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	counts := make(map[string]int)
+	for _, status := range store.statuses {
+		if status.Status != "unknown" {
+			continue
+		}
+		reason := status.Reason
+		if reason == "" {
+			reason = UnknownReasonUnclassified
+		}
+		counts[reason]++
+	}
+	return counts
 }
 
 func (store *fakeCoordinatorStore) GetEventStatus(eventID string) (EventStatus, error) {
@@ -206,7 +224,7 @@ func TestBatchCoordinatorFlushPersistsSuccessfulResults(t *testing.T) {
 	}}
 	coordinator := newTestCoordinator(t, store, backend, CoordinatorConfig{})
 
-	result := coordinator.flush()
+	result := coordinator.flush(flushExplicit)
 	require.Equal(t, 1, result.BatchesAttempted)
 	require.Equal(t, 1, result.BatchesSucceeded)
 	require.Equal(t, 1, result.EventsIntegrated)
@@ -230,7 +248,7 @@ func TestBatchCoordinatorDrains186EventsAndIsIdempotent(t *testing.T) {
 	backend := &fakeBatchBackend{run: successfulBatchResult}
 	coordinator := newTestCoordinator(t, store, backend, CoordinatorConfig{})
 
-	result := coordinator.flush()
+	result := coordinator.flush(flushExplicit)
 	require.Equal(t, 10, result.BatchesAttempted)
 	require.Equal(t, 10, result.BatchesSucceeded)
 	require.Equal(t, 186, result.EventsIntegrated)
@@ -239,7 +257,7 @@ func TestBatchCoordinatorDrains186EventsAndIsIdempotent(t *testing.T) {
 	require.Equal(t, 0, result.EventsRemaining)
 	require.Equal(t, 10, backend.callCount())
 
-	second := coordinator.flush()
+	second := coordinator.flush(flushExplicit)
 	require.Zero(t, second.BatchesAttempted)
 	require.Equal(t, 10, backend.callCount(), "terminal events must not be reprocessed")
 }
@@ -261,7 +279,7 @@ func TestBatchCoordinatorPoisonEventsHaveBoundedCollateral(t *testing.T) {
 	}}
 	coordinator := newTestCoordinator(t, store, backend, CoordinatorConfig{})
 
-	result := coordinator.flush()
+	result := coordinator.flush(flushExplicit)
 	require.GreaterOrEqual(t, result.EventsIntegrated+result.EventsSkipped, 161)
 	require.LessOrEqual(t, result.EventsFailed, 25)
 	require.Zero(t, result.EventsUnknown)
@@ -278,7 +296,7 @@ func TestBatchCoordinatorPoisonEventsHaveBoundedCollateral(t *testing.T) {
 	reset, err := coordinator.ResetEvent(collateralID)
 	require.NoError(t, err)
 	require.Equal(t, "pending", reset.NewStatus)
-	require.Equal(t, 1, coordinator.flush().EventsIntegrated)
+	require.Equal(t, 1, coordinator.flush(flushExplicit).EventsIntegrated)
 }
 
 func TestBatchCoordinatorFlushUsesInsertedRetryBatches(t *testing.T) {
@@ -294,7 +312,7 @@ func TestBatchCoordinatorFlushUsesInsertedRetryBatches(t *testing.T) {
 	coordinator := newTestCoordinator(t, store, backend, CoordinatorConfig{})
 	coordinator.limits = BatchLimits{MaxEventsPerBatch: 20, MaxTokensPerBatch: 1_000_000, MaxBytesPerBatch: 1_000_000}
 
-	result := coordinator.flush()
+	result := coordinator.flush(flushExplicit)
 	require.Equal(t, 3, result.BatchesAttempted)
 	require.Equal(t, 2, result.BatchesSucceeded)
 	require.Equal(t, 1, result.BatchesFailed)
@@ -309,7 +327,7 @@ func TestBatchCoordinatorShutdownCancellationStaysPending(t *testing.T) {
 		return BatchResult{BatchID: batch.ID, Status: "failed", Error: context.Canceled}, nil
 	}}
 	coordinator := newTestCoordinator(t, store, backend, CoordinatorConfig{})
-	result := coordinator.flush()
+	result := coordinator.flush(flushExplicit)
 	require.Equal(t, "stopped", result.StoppedReason)
 	require.Equal(t, 1, result.EventsRemaining)
 	require.Empty(t, store.statuses)
@@ -323,7 +341,7 @@ func TestBatchCoordinatorTerminalTimeoutWritesExactReason(t *testing.T) {
 		return BatchResult{BatchID: batch.ID, Status: "failed", Error: context.DeadlineExceeded}, nil
 	}}
 	coordinator := newTestCoordinator(t, store, backend, CoordinatorConfig{})
-	result := coordinator.flush()
+	result := coordinator.flush(flushExplicit)
 	require.Equal(t, 1, result.EventsFailed)
 	require.Equal(t, "batch_timeout_at_max_depth", store.statuses["a"].Reason)
 }
@@ -338,13 +356,13 @@ func TestBatchCoordinatorOuterErrorsPersistAcrossFlushes(t *testing.T) {
 		return integratedResult(batch), nil
 	}}
 	coordinator := newTestCoordinator(t, store, backend, CoordinatorConfig{})
-	require.Empty(t, coordinator.flush().StoppedReason)
-	require.Empty(t, coordinator.flush().StoppedReason)
-	require.Equal(t, "internal_error_limit", coordinator.flush().StoppedReason)
+	require.Empty(t, coordinator.flush(flushExplicit).StoppedReason)
+	require.Empty(t, coordinator.flush(flushExplicit).StoppedReason)
+	require.Equal(t, "internal_error_limit", coordinator.flush(flushExplicit).StoppedReason)
 	require.Equal(t, 3, coordinator.consecutiveOuterErrors)
 
 	outerFailure = false
-	result := coordinator.flush()
+	result := coordinator.flush(flushExplicit)
 	require.Equal(t, 1, result.BatchesSucceeded)
 	require.Equal(t, 0, coordinator.consecutiveOuterErrors)
 }
@@ -355,7 +373,7 @@ func TestBatchCoordinatorBoundsOuterErrorsAcrossMultipleBatches(t *testing.T) {
 		return BatchResult{}, errors.New("infrastructure failed")
 	}}
 	coordinator := newTestCoordinator(t, store, backend, CoordinatorConfig{})
-	result := coordinator.flush()
+	result := coordinator.flush(flushExplicit)
 	require.Equal(t, "internal_error_limit", result.StoppedReason)
 	require.Equal(t, 3, result.BatchesAttempted)
 	require.Equal(t, 3, result.BatchesFailed)
@@ -388,7 +406,7 @@ func TestBatchCoordinatorOuterErrorCounterResetsWithinFlush(t *testing.T) {
 		return integratedResult(batch), nil
 	}}
 	coordinator := newTestCoordinator(t, store, backend, CoordinatorConfig{})
-	result := coordinator.flush()
+	result := coordinator.flush(flushExplicit)
 	require.Equal(t, 5, result.BatchesAttempted)
 	require.Equal(t, 3, result.BatchesSucceeded)
 	require.Equal(t, 2, result.BatchesFailed)
@@ -407,7 +425,7 @@ func TestBatchCoordinatorMixedSuccessThenOuterErrorLimitSuspends(t *testing.T) {
 		return BatchResult{}, errors.New("persistent infrastructure failure")
 	}}
 	coordinator := newTestCoordinator(t, store, backend, CoordinatorConfig{})
-	result := coordinator.flush()
+	result := coordinator.flush(flushExplicit)
 	require.Equal(t, "internal_error_limit", result.StoppedReason)
 	require.Equal(t, 5, result.BatchesAttempted)
 	require.Equal(t, 2, result.BatchesSucceeded)
@@ -424,7 +442,7 @@ func TestBatchCoordinatorStoreErrorNeverReportsFalseZero(t *testing.T) {
 	store := newFakeCoordinatorStore(PendingEvent{ID: "a"})
 	store.listErr = errors.New("raw log unavailable")
 	coordinator := newTestCoordinator(t, store, &fakeBatchBackend{run: successfulBatchResult}, CoordinatorConfig{})
-	result := coordinator.flush()
+	result := coordinator.flush(flushExplicit)
 	require.Equal(t, "store_error", result.StoppedReason)
 	require.Equal(t, -1, result.EventsRemaining)
 	status := coordinator.Status()
@@ -438,7 +456,7 @@ func TestBatchCoordinatorStatusPopulatesFrozenFailureFields(t *testing.T) {
 		return BatchResult{BatchID: batch.ID, Status: "failed", Error: errors.New("acpmux crashed")}, nil
 	}}
 	coordinator := newTestCoordinator(t, store, backend, CoordinatorConfig{})
-	result := coordinator.flush()
+	result := coordinator.flush(flushExplicit)
 	timer := time.NewTimer(time.Hour)
 	defer timer.Stop()
 	coordinator.scheduleNext(result, timer)
@@ -463,7 +481,7 @@ func TestBatchCoordinatorCountsEachStatusWriteFailure(t *testing.T) {
 	}
 	coordinator := newTestCoordinator(t, store, &fakeBatchBackend{run: successfulBatchResult}, CoordinatorConfig{})
 
-	result := coordinator.flush()
+	result := coordinator.flush(flushExplicit)
 	require.Equal(t, 3, result.StatusWriteErrors)
 	require.Equal(t, 3, result.EventsRemaining)
 	require.Len(t, store.statuses, 17)
@@ -476,12 +494,12 @@ func TestBatchCoordinatorDefersAfterThreeStatusWriteFailures(t *testing.T) {
 	coordinator := newTestCoordinator(t, store, backend, CoordinatorConfig{})
 
 	for range 3 {
-		result := coordinator.flush()
+		result := coordinator.flush(flushExplicit)
 		require.Equal(t, 1, result.StatusWriteErrors)
 	}
 	require.True(t, coordinator.deferredSet["a"])
 	require.Equal(t, 3, backend.callCount())
-	result := coordinator.flush()
+	result := coordinator.flush(flushExplicit)
 	require.Equal(t, 1, result.EventsRemaining)
 	require.Equal(t, 3, backend.callCount())
 
@@ -501,7 +519,7 @@ func TestBatchCoordinatorDefersTerminalFailureStatusWrites(t *testing.T) {
 	}}
 	coordinator := newTestCoordinator(t, store, backend, CoordinatorConfig{})
 	for range 3 {
-		result := coordinator.flush()
+		result := coordinator.flush(flushExplicit)
 		require.Equal(t, 1, result.StatusWriteErrors)
 		require.Equal(t, 1, result.EventsFailed)
 	}
@@ -514,9 +532,9 @@ func TestBatchCoordinatorStatusWriteSuccessClearsFailureCounter(t *testing.T) {
 	store := newFakeCoordinatorStore(PendingEvent{ID: "a"})
 	store.writeErrorsLeft["a"] = 2
 	coordinator := newTestCoordinator(t, store, &fakeBatchBackend{run: successfulBatchResult}, CoordinatorConfig{})
-	coordinator.flush()
-	coordinator.flush()
-	result := coordinator.flush()
+	coordinator.flush(flushExplicit)
+	coordinator.flush(flushExplicit)
+	result := coordinator.flush(flushExplicit)
 	require.Equal(t, 0, result.StatusWriteErrors)
 	require.Empty(t, coordinator.writeFailCounts)
 	require.Empty(t, coordinator.deferredSet)
@@ -527,13 +545,13 @@ func TestBatchCoordinatorDeferredEventsRetryWithFreshCoordinator(t *testing.T) {
 	store.writeErrorsLeft["a"] = 3
 	first := newTestCoordinator(t, store, &fakeBatchBackend{run: successfulBatchResult}, CoordinatorConfig{})
 	for range 3 {
-		first.flush()
+		first.flush(flushExplicit)
 	}
 	require.True(t, first.deferredSet["a"])
 
 	secondBackend := &fakeBatchBackend{run: successfulBatchResult}
 	second := newTestCoordinator(t, store, secondBackend, CoordinatorConfig{})
-	result := second.flush()
+	result := second.flush(flushExplicit)
 	require.Equal(t, 1, result.EventsIntegrated)
 	require.Zero(t, result.EventsRemaining)
 	require.Equal(t, 1, secondBackend.callCount())
@@ -588,6 +606,270 @@ func TestBatchCoordinatorStatusHealthPrecedenceAndDisjointCounts(t *testing.T) {
 	coordinator.suspended = true
 	status = coordinator.Status()
 	require.Equal(t, "suspended", status.Health)
+}
+
+func TestStatusWallClockStuckArm(t *testing.T) {
+	store := newFakeCoordinatorStore(makePendingEvents(2)...)
+	coordinator := newTestCoordinator(t, store, &fakeBatchBackend{run: successfulBatchResult}, CoordinatorConfig{})
+
+	// Fresh in-progress batch: the wall-clock arm must NOT fire.
+	coordinator.currentBatch = &ActiveBatchState{
+		BatchID: "fresh", EventIDs: []string{"event-00"},
+		StartedAt: time.Now().UTC(), BatchIndex: 1, TotalBatches: 1,
+	}
+	status := coordinator.Status()
+	require.Equal(t, "in_progress", status.Health, "fresh batch must stay in_progress")
+
+	// Batch current for longer than 2× the hard batch cap with InProgress > 0:
+	// health must report stuck regardless of the InProgress==0 guard on the
+	// zero-success arm (defense-in-depth vs cap-enforcement bugs).
+	coordinator.currentBatch = &ActiveBatchState{
+		BatchID: "hung", EventIDs: []string{"event-00"},
+		StartedAt:  time.Now().UTC().Add(-wallClockStuckMultiple*MaxBatchCap - time.Second),
+		BatchIndex: 1, TotalBatches: 1,
+	}
+	status = coordinator.Status()
+	require.Equal(t, 1, status.InProgress)
+	require.Equal(t, "stuck", status.Health, "wall-clock arm must fire despite InProgress > 0")
+}
+
+func TestStatusGeneratedAtSingleAnchor(t *testing.T) {
+	store := newFakeCoordinatorStore(makePendingEvents(1)...)
+	coordinator := newTestCoordinator(t, store, &fakeBatchBackend{run: successfulBatchResult}, CoordinatorConfig{})
+	startedAt := time.Now().UTC().Add(-90 * time.Second)
+	coordinator.currentBatch = &ActiveBatchState{
+		BatchID: "anchored", EventIDs: []string{"event-00"},
+		StartedAt: startedAt, BatchIndex: 1, TotalBatches: 1,
+	}
+
+	before := time.Now().UTC()
+	status := coordinator.Status()
+	after := time.Now().UTC()
+
+	require.False(t, status.GeneratedAt.IsZero())
+	require.False(t, status.GeneratedAt.Before(before))
+	require.False(t, status.GeneratedAt.After(after))
+	// elapsed_ms must be derived from the SAME captured anchor as
+	// generated_at — exact equality, zero tolerance (InDelta was blind to
+	// the dual-time.Now() defect; adversary-2 B3).
+	derived := status.GeneratedAt.Sub(status.CurrentBatch.StartedAt).Milliseconds()
+	require.Equal(t, derived, status.CurrentBatch.ElapsedMs)
+}
+
+func allUnknownBatchResult(_ context.Context, batch Batch) (BatchResult, error) {
+	results := make([]EventResult, len(batch.Events))
+	for index, event := range batch.Events {
+		results[index] = EventResult{
+			EventID: event.ID, Status: "unknown",
+			Reason: UnknownReasonNoPerEventVerdict, TranscriptPath: "transcripts/" + batch.ID + ".log",
+		}
+	}
+	return BatchResult{BatchID: batch.ID, Status: "success", EventResults: results}, nil
+}
+
+func singleEventLimits() BatchLimits {
+	limits := DefaultBatchLimits
+	limits.MaxEventsPerBatch = 1
+	return limits
+}
+
+func TestUnknownStreakSuspendsFlush(t *testing.T) {
+	store := newFakeCoordinatorStore(makePendingEvents(6)...)
+	backend := &fakeBatchBackend{run: allUnknownBatchResult}
+	coordinator := newTestCoordinator(t, store, backend, CoordinatorConfig{})
+	coordinator.limits = singleEventLimits()
+
+	result := coordinator.flush(flushExplicit)
+
+	require.Equal(t, StopReasonUnknownStreak, result.StoppedReason)
+	require.Len(t, backend.calls, unknownStreakLimit, "flush must stop after the streak limit, not burn further turns")
+
+	status := coordinator.Status()
+	require.True(t, status.Suspended)
+	require.Equal(t, "suspended", status.Health)
+	require.NotNil(t, status.UnknownStreak)
+	require.Equal(t, unknownStreakLimit, status.UnknownStreak.Batches)
+	require.Equal(t, unknownStreakLimit, status.UnknownStreak.ReasonCounts[UnknownReasonNoPerEventVerdict])
+	require.NotEmpty(t, status.UnknownStreak.TranscriptPaths)
+	require.LessOrEqual(t, len(status.UnknownStreak.TranscriptPaths), unknownStreakLimit)
+	for _, path := range status.UnknownStreak.TranscriptPaths {
+		require.NotEmpty(t, path)
+	}
+	require.Equal(t, unknownStreakLimit, status.UnknownByReason[UnknownReasonNoPerEventVerdict])
+	require.NotNil(t, status.LastError)
+	require.Equal(t, StopReasonUnknownStreak, status.LastError.ErrorClass)
+}
+
+func TestUnknownStreakResetsOnAdjudicatedOutcome(t *testing.T) {
+	// 5 single-event batches; batch 3 integrates. Streak: 1,2,reset,1,2 —
+	// never reaches the limit, so the flush must run to completion.
+	store := newFakeCoordinatorStore(makePendingEvents(5)...)
+	call := 0
+	backend := &fakeBatchBackend{run: func(ctx context.Context, batch Batch) (BatchResult, error) {
+		call++
+		if call == unknownStreakLimit { // an integrated outcome inside the would-be streak
+			results := make([]EventResult, len(batch.Events))
+			for index, event := range batch.Events {
+				results[index] = EventResult{EventID: event.ID, Status: "integrated", Pages: []string{"wiki/p.md"}}
+			}
+			return BatchResult{BatchID: batch.ID, Status: "success", EventResults: results}, nil
+		}
+		return allUnknownBatchResult(ctx, batch)
+	}}
+	coordinator := newTestCoordinator(t, store, backend, CoordinatorConfig{})
+	coordinator.limits = singleEventLimits()
+
+	result := coordinator.flush(flushExplicit)
+
+	require.Empty(t, result.StoppedReason, "adjudicated outcome must reset the streak and let the flush finish")
+	require.Len(t, backend.calls, 5, "all batches must run")
+	status := coordinator.Status()
+	require.False(t, status.Suspended)
+	require.Nil(t, status.UnknownStreak)
+}
+
+func TestUnknownStreakClearedByNextFlush(t *testing.T) {
+	store := newFakeCoordinatorStore(makePendingEvents(3)...)
+	backend := &fakeBatchBackend{run: allUnknownBatchResult}
+	coordinator := newTestCoordinator(t, store, backend, CoordinatorConfig{})
+	coordinator.limits = singleEventLimits()
+
+	first := coordinator.flush(flushExplicit)
+	require.Equal(t, StopReasonUnknownStreak, first.StoppedReason)
+	require.True(t, coordinator.Status().Suspended)
+
+	// The next explicit flush (triggered by /remember or admin retry) clears
+	// the suspension and the streak record before running.
+	second := coordinator.flush(flushExplicit)
+	require.NotEqual(t, StopReasonUnknownStreak, second.StoppedReason, "no pending unknown-eligible events remain")
+	status := coordinator.Status()
+	require.False(t, status.Suspended)
+	require.Nil(t, status.UnknownStreak)
+}
+
+func TestUnknownStreakProbeRetripAfterRecovery(t *testing.T) {
+	store := newFakeCoordinatorStore(makePendingEvents(4)...)
+	backend := &fakeBatchBackend{run: allUnknownBatchResult}
+	coordinator := newTestCoordinator(t, store, backend, CoordinatorConfig{})
+	coordinator.limits = singleEventLimits()
+
+	first := coordinator.flush(flushExplicit)
+	require.Equal(t, StopReasonUnknownStreak, first.StoppedReason)
+	require.Len(t, backend.calls, unknownStreakLimit)
+
+	// Probe semantics: recovery clears the suspension but NOT the counter.
+	// With the agent still silently failing, the very next all-unknown batch
+	// re-trips — each recovery attempt costs one probe turn, not N.
+	second := coordinator.flush(flushExplicit)
+	require.Equal(t, StopReasonUnknownStreak, second.StoppedReason)
+	require.Len(t, backend.calls, unknownStreakLimit+1, "re-trip must cost exactly one probe batch")
+	status := coordinator.Status()
+	require.True(t, status.Suspended)
+	require.NotNil(t, status.UnknownStreak)
+	require.Equal(t, unknownStreakLimit+1, status.UnknownStreak.Batches)
+}
+
+func TestUnknownStreakAutoFlushRetainsEvidence(t *testing.T) {
+	store := newFakeCoordinatorStore(makePendingEvents(4)...)
+	backend := &fakeBatchBackend{run: allUnknownBatchResult}
+	coordinator := newTestCoordinator(t, store, backend, CoordinatorConfig{})
+	coordinator.limits = singleEventLimits()
+
+	first := coordinator.flush(flushExplicit)
+	require.Equal(t, StopReasonUnknownStreak, first.StoppedReason)
+
+	// An auto (timer/threshold) flush while suspended is a no-op: it burns no
+	// turns and the unknown_streak stop record survives for the operator.
+	calls := len(backend.calls)
+	auto := coordinator.flush(flushAuto)
+	require.Equal(t, StopReasonStopped, auto.StoppedReason)
+	require.Len(t, backend.calls, calls, "auto flush while suspended must not run batches")
+	status := coordinator.Status()
+	require.True(t, status.Suspended)
+	require.NotNil(t, status.UnknownStreak, "stop record must survive auto flushes")
+}
+
+func TestSubThresholdRememberClearsSuspensionAndRecordAtomically(t *testing.T) {
+	store := newFakeCoordinatorStore(makePendingEvents(3)...)
+	backend := &fakeBatchBackend{run: allUnknownBatchResult}
+	coordinator := newTestCoordinator(t, store, backend, CoordinatorConfig{})
+	coordinator.limits = singleEventLimits()
+
+	first := coordinator.flush(flushExplicit)
+	require.Equal(t, StopReasonUnknownStreak, first.StoppedReason)
+	require.True(t, coordinator.Status().Suspended)
+	require.NotNil(t, coordinator.Status().UnknownStreak)
+
+	// Sub-threshold /remember: NotifyNewEvent is the recovery point — it must
+	// clear the suspension AND the stop record atomically, because the flush
+	// that follows arrives via the timer (flushAuto) and never runs the
+	// explicit-flush clearing path.
+	coordinator.NotifyNewEvent("event-probe")
+	status := coordinator.Status()
+	require.False(t, status.Suspended)
+	require.Nil(t, status.UnknownStreak, "stop record must clear with the suspension, not linger")
+
+	// The subsequent timer flush probes normally (no suspended no-op), and
+	// with the agent still silently failing it re-trips with a NEW record —
+	// the streak counter survived the recovery (probe semantics).
+	auto := coordinator.flush(flushAuto)
+	require.Equal(t, StopReasonUnknownStreak, auto.StoppedReason)
+	status = coordinator.Status()
+	require.True(t, status.Suspended)
+	require.NotNil(t, status.UnknownStreak)
+	require.Equal(t, unknownStreakLimit+1, status.UnknownStreak.Batches, "probe re-trip must cost one batch and produce a fresh record")
+}
+
+func TestStatusElapsedNeverNegativeUnderConcurrentBatchStart(t *testing.T) {
+	store := newFakeCoordinatorStore(makePendingEvents(1)...)
+	coordinator := newTestCoordinator(t, store, &fakeBatchBackend{run: successfulBatchResult}, CoordinatorConfig{})
+
+	// generatedAt is captured inside the same critical section that snapshots
+	// currentBatch, so a concurrent setCurrentBatch can never yield
+	// generated_at < started_at (negative elapsed_ms).
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 500; i++ {
+			coordinator.setCurrentBatch(Batch{ID: "race", Events: makePendingEvents(1)}, 1, 1)
+		}
+	}()
+	for i := 0; i < 200; i++ {
+		status := coordinator.Status()
+		if status.CurrentBatch != nil {
+			require.GreaterOrEqual(t, status.CurrentBatch.ElapsedMs, int64(0))
+			require.False(t, status.GeneratedAt.Before(status.CurrentBatch.StartedAt),
+				"generated_at must never precede started_at")
+		}
+	}
+	<-done
+}
+
+func TestFlushStopReasonsDocumented(t *testing.T) {
+	source, err := os.ReadFile("coordinator.go")
+	require.NoError(t, err)
+	text := string(source)
+	commentStart := strings.Index(text, "// Flush stop reasons.")
+	require.GreaterOrEqual(t, commentStart, 0, "stop-reason doc comment missing")
+	commentEnd := strings.Index(text[commentStart:], "const (")
+	require.Greater(t, commentEnd, 0)
+	comment := text[commentStart : commentStart+commentEnd]
+	for _, reason := range []string{
+		StopReasonEnvelopeTimeout, StopReasonStopped, StopReasonInternalErrorLimit,
+		StopReasonStoreError, StopReasonUnknownStreak,
+	} {
+		require.Contains(t, comment, "\""+reason+"\"", "stop reason %q missing from doc comment", reason)
+	}
+}
+
+func TestUnknownOutcomeAlwaysHasReasonAndTranscript(t *testing.T) {
+	batch := Batch{ID: "batch-x", Events: makePendingEvents(1)}
+	// Unclassifiable output with no transcript persisted: reason must fall
+	// back to the closed enum and transcript to a non-empty marker.
+	results := parseEventResults(batch, "unstructured", "")
+	require.Equal(t, "unknown", results[0].Status)
+	require.Equal(t, UnknownReasonNoPerEventVerdict, results[0].Reason)
+	require.NotEmpty(t, results[0].TranscriptPath)
 }
 
 func TestBatchCoordinatorAdminTransitions(t *testing.T) {
@@ -673,7 +955,7 @@ func TestBatchCoordinatorAdminAndFlushUseLastEntryWins(t *testing.T) {
 	}}
 	coordinator := newTestCoordinator(t, store, backend, CoordinatorConfig{})
 	flushDone := make(chan FlushResult, 1)
-	go func() { flushDone <- coordinator.flush() }()
+	go func() { flushDone <- coordinator.flush(flushExplicit) }()
 	select {
 	case <-started:
 	case <-time.After(time.Second):
