@@ -198,9 +198,25 @@ func (b *ACPBackend) RunBatchIngest(ctx context.Context, batch Batch, wikiMu *sy
 	indexErr := rebuildIndex()
 	wikiMu.Unlock()
 	result.Status = "success"
-	result.EventResults = parseEventResults(batch, turnResult.Summary)
+	result.EventResults = parseEventResults(batch, turnResult.Summary, b.persistTranscript(batch.ID, turnResult.Summary))
 	result.IndexStale = indexErr != nil
 	return finish(), nil
+}
+
+// persistTranscript writes the agent turn output for a batch under
+// <dataDir>/transcripts so unknown outcomes always reference reviewable
+// evidence. Best-effort: on failure it returns a non-empty marker instead of
+// a path (the unknown contract forbids empty transcript references).
+func (b *ACPBackend) persistTranscript(batchID, summary string) string {
+	dir := filepath.Join(b.dataDir, "transcripts")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "transcript-write-failed"
+	}
+	path := filepath.Join(dir, batchID+".log")
+	if err := os.WriteFile(path, []byte(summary), 0o644); err != nil {
+		return "transcript-write-failed"
+	}
+	return path
 }
 
 func (b *ACPBackend) RunCompile(_ context.Context, _ uint64) (CompileResult, error) {

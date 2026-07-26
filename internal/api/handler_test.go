@@ -501,6 +501,12 @@ func TestStatusEndpoint(t *testing.T) {
 	if stats.IngestTimeout != h.EffectiveIngestTimeout().String() {
 		t.Fatalf("ingest_timeout=%q, want %q", stats.IngestTimeout, h.EffectiveIngestTimeout().String())
 	}
+	if stats.GeneratedAt.IsZero() {
+		t.Fatal("generated_at must be set on every /status snapshot")
+	}
+	if time.Since(stats.GeneratedAt) > time.Minute {
+		t.Fatalf("generated_at=%s is not fresh", stats.GeneratedAt)
+	}
 	if stats.MaxConcurrentIntegrations != h.MaxConcurrentIntegrations() {
 		t.Fatalf("max_concurrent_integrations=%d, want %d", stats.MaxConcurrentIntegrations, h.MaxConcurrentIntegrations())
 	}

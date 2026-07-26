@@ -161,21 +161,21 @@ func TestParseEventResults(t *testing.T) {
 		"EVENT d INTEGRATED missing-prefix",
 	}, "\n")
 
-	got := parseEventResults(batch, summary)
+	got := parseEventResults(batch, summary, "transcripts/test.log")
 	require.Equal(t, []EventResult{
 		{EventID: "a", Status: "failed_by_agent", Reason: "later result wins"},
 		{EventID: "b", Status: "skipped", Reason: "duplicate"},
 		{EventID: "c", Status: "failed_by_agent", Reason: "cannot classify"},
-		{EventID: "d", Status: "unknown", Reason: "not reported by agent"},
+		{EventID: "d", Status: "unknown", Reason: UnknownReasonNoPerEventVerdict, TranscriptPath: "transcripts/test.log"},
 	}, got)
 }
 
 func TestParseEventResultsUnknownReasons(t *testing.T) {
 	batch := makeBatch([]PendingEvent{{ID: "a"}, {ID: "b"}}, 0)
 
-	require.Equal(t, "empty agent output", parseEventResults(batch, "")[0].Reason)
-	require.Equal(t, "no matching event IDs in output", parseEventResults(batch, "EVENT foreign SKIPPED reason: no")[0].Reason)
-	require.Equal(t, "not reported by agent", parseEventResults(batch, "unstructured summary")[0].Reason)
+	require.Equal(t, UnknownReasonTurnEndedNoOutput, parseEventResults(batch, "", "transcripts/test.log")[0].Reason)
+	require.Equal(t, UnknownReasonMalformedVerdict, parseEventResults(batch, "EVENT foreign SKIPPED reason: no", "transcripts/test.log")[0].Reason)
+	require.Equal(t, UnknownReasonNoPerEventVerdict, parseEventResults(batch, "unstructured summary", "transcripts/test.log")[0].Reason)
 }
 
 func TestMakeBatchRecomputesRetryMetadata(t *testing.T) {

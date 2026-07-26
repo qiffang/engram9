@@ -438,19 +438,24 @@ func (h *Handler) handleCompile(w http.ResponseWriter, r *http.Request) {
 // StatusResponse extends MemoryStats with runtime info.
 type StatusResponse struct {
 	storage.MemoryStats
-	PendingIntegrations          int64  `json:"pending_integrations"`
-	IngestErrorCount             int64  `json:"ingest_error_count"`
-	IngestTimeout                string `json:"ingest_timeout"`
-	MaxConcurrentIntegrations    int    `json:"max_concurrent_integrations"`
-	MaxToolLoops                 int    `json:"max_tool_loops"`
-	MaxRepeatedReadOnlyToolCalls int    `json:"max_repeated_read_only_tool_calls"`
-	MaxInvalidToolCalls          int    `json:"max_invalid_tool_calls"`
-	LLMRetryAttempts             int    `json:"llm_retry_attempts"`
-	LLMRetryBackoff              string `json:"llm_retry_backoff"`
-	LLMCallTimeout               string `json:"llm_call_timeout"`
-	LLMProvider                  string `json:"llm_provider,omitempty"`
-	LLMModel                     string `json:"llm_model,omitempty"`
-	LLMBaseURL                   string `json:"llm_base_url,omitempty"`
+	// GeneratedAt timestamps this snapshot. Consumers presenting a snapshot
+	// as failure evidence MUST include it and MUST NOT present a snapshot
+	// older than one refresh interval as current state (task #66: a 2-day-old
+	// snapshot was mistaken for live state and misled diagnosis).
+	GeneratedAt                  time.Time `json:"generated_at"`
+	PendingIntegrations          int64     `json:"pending_integrations"`
+	IngestErrorCount             int64     `json:"ingest_error_count"`
+	IngestTimeout                string    `json:"ingest_timeout"`
+	MaxConcurrentIntegrations    int       `json:"max_concurrent_integrations"`
+	MaxToolLoops                 int       `json:"max_tool_loops"`
+	MaxRepeatedReadOnlyToolCalls int       `json:"max_repeated_read_only_tool_calls"`
+	MaxInvalidToolCalls          int       `json:"max_invalid_tool_calls"`
+	LLMRetryAttempts             int       `json:"llm_retry_attempts"`
+	LLMRetryBackoff              string    `json:"llm_retry_backoff"`
+	LLMCallTimeout               string    `json:"llm_call_timeout"`
+	LLMProvider                  string    `json:"llm_provider,omitempty"`
+	LLMModel                     string    `json:"llm_model,omitempty"`
+	LLMBaseURL                   string    `json:"llm_base_url,omitempty"`
 	// Per-capability backend identifiers.
 	IngestBackend  string                   `json:"ingest_backend"`
 	CompileBackend string                   `json:"compile_backend"`
@@ -477,6 +482,7 @@ func (h *Handler) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, StatusResponse{
 		MemoryStats:                  *stats,
+		GeneratedAt:                  time.Now().UTC(),
 		PendingIntegrations:          pendingIntegrations,
 		IngestErrorCount:             ingestErrorCount,
 		IngestTimeout:                h.effectiveIngestTimeout().String(),

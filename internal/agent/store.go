@@ -60,20 +60,22 @@ type StoreConfig struct {
 }
 
 type StatusEntry struct {
-	EventID   string    `json:"event_id"`
-	Status    string    `json:"status"`
-	BatchID   string    `json:"batch_id,omitempty"`
-	Reason    string    `json:"reason,omitempty"`
-	Pages     []string  `json:"pages,omitempty"`
-	Timestamp time.Time `json:"timestamp"`
-	Recovered bool      `json:"recovered,omitempty"`
+	EventID        string    `json:"event_id"`
+	Status         string    `json:"status"`
+	BatchID        string    `json:"batch_id,omitempty"`
+	Reason         string    `json:"reason,omitempty"`
+	Pages          []string  `json:"pages,omitempty"`
+	TranscriptPath string    `json:"transcript_path,omitempty"`
+	Timestamp      time.Time `json:"timestamp"`
+	Recovered      bool      `json:"recovered,omitempty"`
 }
 
 type EventStatus struct {
-	Status  string
-	BatchID string
-	Reason  string
-	Pages   []string
+	Status         string
+	BatchID        string
+	Reason         string
+	Pages          []string
+	TranscriptPath string
 }
 
 type StatusCounts struct {
@@ -86,17 +88,18 @@ type StatusCounts struct {
 }
 
 type statusRecord struct {
-	EventID   string    `json:"event_id,omitempty"`
-	Status    string    `json:"status,omitempty"`
-	Type      string    `json:"type,omitempty"`
-	BatchID   string    `json:"batch_id,omitempty"`
-	Reason    string    `json:"reason,omitempty"`
-	Pages     []string  `json:"pages,omitempty"`
-	Timestamp time.Time `json:"timestamp,omitempty"`
-	Recovered bool      `json:"recovered,omitempty"`
-	OldStatus string    `json:"old_status,omitempty"`
-	Operator  string    `json:"operator,omitempty"`
-	Epoch     string    `json:"epoch,omitempty"`
+	EventID        string    `json:"event_id,omitempty"`
+	Status         string    `json:"status,omitempty"`
+	Type           string    `json:"type,omitempty"`
+	BatchID        string    `json:"batch_id,omitempty"`
+	Reason         string    `json:"reason,omitempty"`
+	Pages          []string  `json:"pages,omitempty"`
+	TranscriptPath string    `json:"transcript_path,omitempty"`
+	Timestamp      time.Time `json:"timestamp,omitempty"`
+	Recovered      bool      `json:"recovered,omitempty"`
+	OldStatus      string    `json:"old_status,omitempty"`
+	Operator       string    `json:"operator,omitempty"`
+	Epoch          string    `json:"epoch,omitempty"`
 }
 
 type PendingEventStore struct {
@@ -312,7 +315,8 @@ func applyStatusRecord(terminal map[string]EventStatus, record statusRecord) {
 		return
 	}
 	terminal[record.EventID] = EventStatus{
-		Status: record.Status, BatchID: record.BatchID, Reason: record.Reason, Pages: append([]string(nil), record.Pages...),
+		Status: record.Status, BatchID: record.BatchID, Reason: record.Reason,
+		Pages: append([]string(nil), record.Pages...), TranscriptPath: record.TranscriptPath,
 	}
 }
 
@@ -432,7 +436,8 @@ func (store *PendingEventStore) WriteStatuses(entries []StatusEntry) error {
 	for _, entry := range normalized {
 		store.knownIDs[entry.EventID] = struct{}{}
 		store.terminal[entry.EventID] = EventStatus{
-			Status: entry.Status, BatchID: entry.BatchID, Reason: entry.Reason, Pages: append([]string(nil), entry.Pages...),
+			Status: entry.Status, BatchID: entry.BatchID, Reason: entry.Reason,
+			Pages: append([]string(nil), entry.Pages...), TranscriptPath: entry.TranscriptPath,
 		}
 		delete(store.pendingIDs, entry.EventID)
 	}
@@ -563,6 +568,29 @@ func (store *PendingEventStore) RecoverFromCrash(wikiDir string) error {
 	}
 	log.Printf("[batch-ingest] recovered %d pending events from wiki frontmatter", len(entries))
 	return nil
+}
+
+// UnknownByReason returns the count of terminal "unknown" events grouped by
+// their closed-enum reason. Empty reasons (legacy records) group under
+// "unclassified".
+func (store *PendingEventStore) UnknownByReason() map[string]int {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	counts := make(map[string]int)
+	for id, status := range store.terminal {
+		if _, exists := store.knownIDs[id]; !exists {
+			continue
+		}
+		if status.Status != "unknown" {
+			continue
+		}
+		reason := status.Reason
+		if reason == "" {
+			reason = UnknownReasonUnclassified
+		}
+		counts[reason]++
+	}
+	return counts
 }
 
 func (store *PendingEventStore) Counts() StatusCounts {
