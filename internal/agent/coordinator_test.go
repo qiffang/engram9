@@ -789,6 +789,62 @@ func TestUnknownStreakAutoFlushRetainsEvidence(t *testing.T) {
 	require.NotNil(t, status.UnknownStreak, "stop record must survive auto flushes")
 }
 
+func TestSubThresholdRememberClearsSuspensionAndRecordAtomically(t *testing.T) {
+	store := newFakeCoordinatorStore(makePendingEvents(3)...)
+	backend := &fakeBatchBackend{run: allUnknownBatchResult}
+	coordinator := newTestCoordinator(t, store, backend, CoordinatorConfig{})
+	coordinator.limits = singleEventLimits()
+
+	first := coordinator.flush(flushExplicit)
+	require.Equal(t, StopReasonUnknownStreak, first.StoppedReason)
+	require.True(t, coordinator.Status().Suspended)
+	require.NotNil(t, coordinator.Status().UnknownStreak)
+
+	// Sub-threshold /remember: NotifyNewEvent is the recovery point — it must
+	// clear the suspension AND the stop record atomically, because the flush
+	// that follows arrives via the timer (flushAuto) and never runs the
+	// explicit-flush clearing path.
+	coordinator.NotifyNewEvent("event-probe")
+	status := coordinator.Status()
+	require.False(t, status.Suspended)
+	require.Nil(t, status.UnknownStreak, "stop record must clear with the suspension, not linger")
+
+	// The subsequent timer flush probes normally (no suspended no-op), and
+	// with the agent still silently failing it re-trips with a NEW record —
+	// the streak counter survived the recovery (probe semantics).
+	auto := coordinator.flush(flushAuto)
+	require.Equal(t, StopReasonUnknownStreak, auto.StoppedReason)
+	status = coordinator.Status()
+	require.True(t, status.Suspended)
+	require.NotNil(t, status.UnknownStreak)
+	require.Equal(t, unknownStreakLimit+1, status.UnknownStreak.Batches, "probe re-trip must cost one batch and produce a fresh record")
+}
+
+func TestStatusElapsedNeverNegativeUnderConcurrentBatchStart(t *testing.T) {
+	store := newFakeCoordinatorStore(makePendingEvents(1)...)
+	coordinator := newTestCoordinator(t, store, &fakeBatchBackend{run: successfulBatchResult}, CoordinatorConfig{})
+
+	// generatedAt is captured inside the same critical section that snapshots
+	// currentBatch, so a concurrent setCurrentBatch can never yield
+	// generated_at < started_at (negative elapsed_ms).
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 500; i++ {
+			coordinator.setCurrentBatch(Batch{ID: "race", Events: makePendingEvents(1)}, 1, 1)
+		}
+	}()
+	for i := 0; i < 200; i++ {
+		status := coordinator.Status()
+		if status.CurrentBatch != nil {
+			require.GreaterOrEqual(t, status.CurrentBatch.ElapsedMs, int64(0))
+			require.False(t, status.GeneratedAt.Before(status.CurrentBatch.StartedAt),
+				"generated_at must never precede started_at")
+		}
+	}
+	<-done
+}
+
 func TestFlushStopReasonsDocumented(t *testing.T) {
 	source, err := os.ReadFile("coordinator.go")
 	require.NoError(t, err)

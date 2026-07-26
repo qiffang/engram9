@@ -263,10 +263,16 @@ func newBatchCoordinator(backend batchIngestBackend, store pendingEventStore, in
 	}
 }
 
+// NotifyNewEvent is the /remember-side explicit recovery point: it clears a
+// suspension AND its unknown_streak stop record (the evidence belongs to the
+// cleared trip). This covers the sub-threshold path where the subsequent
+// flush arrives via the timer (flushAuto) — recovery must not depend on the
+// threshold branch selecting an explicit flush.
 func (coordinator *BatchCoordinator) NotifyNewEvent(eventID string) {
 	coordinator.store.NotifyAppended(eventID)
 	coordinator.mu.Lock()
 	coordinator.suspended = false
+	coordinator.unknownStreakStop = nil
 	coordinator.mu.Unlock()
 	coordinator.signalPending()
 }
@@ -299,6 +305,7 @@ func (coordinator *BatchCoordinator) ResetEvent(eventID string) (AdminResult, er
 	}
 	coordinator.store.NotifyAppended(eventID)
 	coordinator.suspended = false
+	coordinator.unknownStreakStop = nil
 	coordinator.signalPending()
 	return AdminResult{EventID: eventID, OldStatus: status.Status, NewStatus: "pending"}, nil
 }
@@ -907,9 +914,13 @@ func (coordinator *BatchCoordinator) Stop(shutdownContext context.Context) {
 }
 
 func (coordinator *BatchCoordinator) Status() CoordinatorStatus {
-	generatedAt := time.Now().UTC()
 	coordinator.mu.Lock()
 	defer coordinator.mu.Unlock()
+	// The snapshot anchor is captured INSIDE the critical section: a
+	// concurrent setCurrentBatch also stamps StartedAt under mu, so
+	// generated_at can never precede started_at and elapsed_ms can never go
+	// negative (adversary-1, PR #38 R2).
+	generatedAt := time.Now().UTC()
 	counts := coordinator.store.Counts()
 	inProgress := 0
 	var currentBatch *CurrentBatchStatus
