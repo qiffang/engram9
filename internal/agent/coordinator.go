@@ -189,32 +189,42 @@ func (transition *TransitionError) Error() string {
 }
 
 type BatchCoordinator struct {
-	mu                     sync.Mutex
-	pending                chan struct{}
-	backend                batchIngestBackend
-	store                  pendingEventStore
-	indexRebuilder         WikiIndexRebuilder
-	wikiMu                 *sync.Mutex
-	wikiDir                string
-	progressPath           string
-	cfg                    CoordinatorConfig
-	limits                 BatchLimits
-	lastResult             *FlushResult
-	lastFlushAt            time.Time
-	lastError              *BatchError
-	indexStale             bool
-	writeFailCounts        map[string]int
-	deferredSet            map[string]bool
-	unknownStreakStop      *UnknownStreakStop
-	consecutiveOuterErrors int
-	suspended              bool
-	currentBatch           *ActiveBatchState
-	stopCh                 chan struct{}
-	stopOnce               sync.Once
-	cancelBatch            context.CancelFunc
-	done                   chan struct{}
-	started                bool
-	hardStopTimeout        time.Duration
+	mu                sync.Mutex
+	pending           chan struct{}
+	backend           batchIngestBackend
+	store             pendingEventStore
+	indexRebuilder    WikiIndexRebuilder
+	wikiMu            *sync.Mutex
+	wikiDir           string
+	progressPath      string
+	cfg               CoordinatorConfig
+	limits            BatchLimits
+	lastResult        *FlushResult
+	lastFlushAt       time.Time
+	lastError         *BatchError
+	indexStale        bool
+	writeFailCounts   map[string]int
+	deferredSet       map[string]bool
+	unknownStreakStop *UnknownStreakStop
+	// Cross-flush unknown-streak state (process-local per the ephemeral
+	// declaration). Flush boundaries do NOT reset the streak: under trickle
+	// load a flush may contain only 1-2 batches and a flush-local counter
+	// would never trip while ACP turns keep burning. The counter also
+	// survives a trip (probe semantics): after recovery clears the
+	// suspension, a single further all-unknown batch re-trips, so each
+	// recovery attempt costs one probe turn, not N.
+	unknownStreak            int
+	unknownStreakReasons     map[string]int
+	unknownStreakTranscripts []string
+	consecutiveOuterErrors   int
+	suspended                bool
+	currentBatch             *ActiveBatchState
+	stopCh                   chan struct{}
+	stopOnce                 sync.Once
+	cancelBatch              context.CancelFunc
+	done                     chan struct{}
+	started                  bool
+	hardStopTimeout          time.Duration
 }
 
 func NewBatchCoordinator(backend *ACPBackend, store *PendingEventStore, indexRebuilder WikiIndexRebuilder, wikiMu *sync.Mutex, wikiDir string, cfg CoordinatorConfig) *BatchCoordinator {
@@ -235,20 +245,21 @@ func newBatchCoordinator(backend batchIngestBackend, store pendingEventStore, in
 		cfg.ResumeDelay = DefaultResumeDelay
 	}
 	return &BatchCoordinator{
-		pending:         make(chan struct{}, 1),
-		backend:         backend,
-		store:           store,
-		indexRebuilder:  indexRebuilder,
-		wikiMu:          wikiMu,
-		wikiDir:         wikiDir,
-		progressPath:    filepath.Join(filepath.Dir(wikiDir), "batch_ingest.log"),
-		cfg:             cfg,
-		limits:          DefaultBatchLimits,
-		writeFailCounts: make(map[string]int),
-		deferredSet:     make(map[string]bool),
-		stopCh:          make(chan struct{}),
-		done:            make(chan struct{}),
-		hardStopTimeout: coordinatorHardStop,
+		pending:              make(chan struct{}, 1),
+		backend:              backend,
+		store:                store,
+		indexRebuilder:       indexRebuilder,
+		wikiMu:               wikiMu,
+		wikiDir:              wikiDir,
+		progressPath:         filepath.Join(filepath.Dir(wikiDir), "batch_ingest.log"),
+		cfg:                  cfg,
+		limits:               DefaultBatchLimits,
+		writeFailCounts:      make(map[string]int),
+		deferredSet:          make(map[string]bool),
+		unknownStreakReasons: make(map[string]int),
+		stopCh:               make(chan struct{}),
+		done:                 make(chan struct{}),
+		hardStopTimeout:      coordinatorHardStop,
 	}
 }
 
@@ -370,12 +381,12 @@ func (coordinator *BatchCoordinator) run(ready chan struct{}) {
 				continue
 			}
 			if count >= coordinator.cfg.FlushThreshold {
-				coordinator.scheduleNext(coordinator.flush(), timer)
+				coordinator.scheduleNext(coordinator.flush(flushExplicit), timer)
 			} else {
 				resetTimer(timer, coordinator.cfg.FlushInterval)
 			}
 		case <-timer.C:
-			coordinator.scheduleNext(coordinator.flush(), timer)
+			coordinator.scheduleNext(coordinator.flush(flushAuto), timer)
 		}
 	}
 }
@@ -431,11 +442,28 @@ func (coordinator *BatchCoordinator) scheduleNext(result FlushResult, timer *tim
 	}
 }
 
-func (coordinator *BatchCoordinator) flush() FlushResult {
+// Flush triggers. Explicit triggers (/remember, admin retry — anything
+// arriving via the pending channel) clear a suspension and its unknown_streak
+// evidence; auto triggers (timer/threshold) never do — while suspended, an
+// auto flush is a no-op so the stop record survives until an operator acts
+// (auto-flush should not fire while suspended at all; this guards future
+// bypasses).
+const (
+	flushExplicit = true
+	flushAuto     = false
+)
+
+func (coordinator *BatchCoordinator) flush(explicit bool) FlushResult {
 	deadline := time.Now().Add(coordinator.cfg.EnvelopeTimeout)
 	coordinator.mu.Lock()
+	if coordinator.suspended && !explicit {
+		coordinator.mu.Unlock()
+		return FlushResult{StoppedReason: StopReasonStopped, EventsRemaining: -1}
+	}
 	coordinator.suspended = false
-	coordinator.unknownStreakStop = nil
+	if explicit {
+		coordinator.unknownStreakStop = nil
+	}
 	coordinator.mu.Unlock()
 
 	events, err := coordinator.store.ListPendingEvents()
@@ -469,9 +497,6 @@ func (coordinator *BatchCoordinator) flush() FlushResult {
 
 	batches := FormBatches(filtered, coordinator.limits)
 	result := FlushResult{}
-	unknownStreak := 0
-	streakReasons := make(map[string]int)
-	var streakTranscripts []string
 	for index := 0; index < len(batches); index++ {
 		batch := batches[index]
 		if time.Now().After(deadline) {
@@ -541,46 +566,10 @@ func (coordinator *BatchCoordinator) flush() FlushResult {
 				}
 			}
 			coordinator.emitProgress(batch, batchResult, index+1, len(batches), "completed")
-			if adjudicated > 0 {
-				unknownStreak = 0
-				streakReasons = make(map[string]int)
-				streakTranscripts = nil
-			} else if batchUnknown > 0 {
-				unknownStreak++
-				for _, eventResult := range batchResult.EventResults {
-					if eventResult.Status == "unknown" {
-						streakReasons[eventResult.Reason]++
-					}
-				}
-				if len(streakTranscripts) < unknownStreakLimit {
-					for _, eventResult := range batchResult.EventResults {
-						if eventResult.Status == "unknown" && eventResult.TranscriptPath != "" {
-							streakTranscripts = append(streakTranscripts, eventResult.TranscriptPath)
-							break
-						}
-					}
-				}
-				if unknownStreak >= unknownStreakLimit {
-					// Unknown-streak breaker: the agent is completing turns
-					// without adjudicating any event. Suspend (invariant #17
-					// semantics) instead of burning more provider turns; the
-					// next /remember or an admin retry clears it.
-					stop := &UnknownStreakStop{
-						Batches: unknownStreak, ReasonCounts: streakReasons, TranscriptPaths: streakTranscripts,
-					}
-					coordinator.mu.Lock()
-					coordinator.suspended = true
-					coordinator.unknownStreakStop = stop
-					coordinator.lastError = &BatchError{
-						BatchID: batch.ID, ErrorClass: StopReasonUnknownStreak,
-						Message:   fmt.Sprintf("%d consecutive all-unknown batches; see unknown_streak in status", unknownStreak),
-						Timestamp: time.Now().UTC(),
-					}
-					coordinator.mu.Unlock()
-					result.StoppedReason = StopReasonUnknownStreak
-					result.EventsRemaining = coordinator.safeRemainingCount()
-					return result
-				}
+			if tripped := coordinator.recordBatchOutcomes(batch.ID, batchResult, adjudicated, batchUnknown); tripped {
+				result.StoppedReason = StopReasonUnknownStreak
+				result.EventsRemaining = coordinator.safeRemainingCount()
+				return result
 			}
 		case "failed":
 			result.BatchesFailed++
@@ -639,6 +628,65 @@ func (coordinator *BatchCoordinator) batchTimeout(batch Batch) time.Duration {
 		timeout = DefaultACPTurnTimeout
 	}
 	return timeout
+}
+
+// recordBatchOutcomes advances or resets the cross-flush unknown-streak
+// state after a completed batch and trips the breaker at unknownStreakLimit:
+// the agent is completing turns without adjudicating any event, so suspend
+// (invariant #17 semantics) instead of burning more provider turns. ONLY an
+// adjudicated outcome resets the counter; a batch with neither adjudicated
+// nor unknown outcomes (structurally unreachable today) leaves it unchanged.
+// The counter survives a trip (probe semantics): after /remember or admin
+// retry clears the suspension, one further all-unknown batch re-trips.
+func (coordinator *BatchCoordinator) recordBatchOutcomes(batchID string, batchResult BatchResult, adjudicated, batchUnknown int) bool {
+	coordinator.mu.Lock()
+	defer coordinator.mu.Unlock()
+	if adjudicated > 0 {
+		coordinator.unknownStreak = 0
+		coordinator.unknownStreakReasons = make(map[string]int)
+		coordinator.unknownStreakTranscripts = nil
+		return false
+	}
+	if batchUnknown == 0 {
+		return false
+	}
+	coordinator.unknownStreak++
+	for _, eventResult := range batchResult.EventResults {
+		if eventResult.Status == "unknown" {
+			coordinator.unknownStreakReasons[eventResult.Reason]++
+		}
+	}
+	if len(coordinator.unknownStreakTranscripts) < unknownStreakLimit {
+		for _, eventResult := range batchResult.EventResults {
+			if eventResult.Status == "unknown" && eventResult.TranscriptPath != "" {
+				coordinator.unknownStreakTranscripts = append(coordinator.unknownStreakTranscripts, eventResult.TranscriptPath)
+				break
+			}
+		}
+	}
+	if coordinator.unknownStreak < unknownStreakLimit {
+		return false
+	}
+	coordinator.suspended = true
+	coordinator.unknownStreakStop = &UnknownStreakStop{
+		Batches:         coordinator.unknownStreak,
+		ReasonCounts:    copyReasonCounts(coordinator.unknownStreakReasons),
+		TranscriptPaths: append([]string(nil), coordinator.unknownStreakTranscripts...),
+	}
+	coordinator.lastError = &BatchError{
+		BatchID: batchID, ErrorClass: StopReasonUnknownStreak,
+		Message:   fmt.Sprintf("%d consecutive all-unknown batches; see unknown_streak in status", coordinator.unknownStreak),
+		Timestamp: time.Now().UTC(),
+	}
+	return true
+}
+
+func copyReasonCounts(counts map[string]int) map[string]int {
+	copied := make(map[string]int, len(counts))
+	for reason, count := range counts {
+		copied[reason] = count
+	}
+	return copied
 }
 
 func (coordinator *BatchCoordinator) setCurrentBatch(batch Batch, index, total int) {
@@ -859,6 +907,7 @@ func (coordinator *BatchCoordinator) Stop(shutdownContext context.Context) {
 }
 
 func (coordinator *BatchCoordinator) Status() CoordinatorStatus {
+	generatedAt := time.Now().UTC()
 	coordinator.mu.Lock()
 	defer coordinator.mu.Unlock()
 	counts := coordinator.store.Counts()
@@ -870,7 +919,7 @@ func (coordinator *BatchCoordinator) Status() CoordinatorStatus {
 			ID: coordinator.currentBatch.BatchID, EventIDs: append([]string(nil), coordinator.currentBatch.EventIDs...),
 			Index: coordinator.currentBatch.BatchIndex, TotalBatches: coordinator.currentBatch.TotalBatches,
 			EventsInBatch: len(coordinator.currentBatch.EventIDs), StartedAt: coordinator.currentBatch.StartedAt,
-			ElapsedMs: time.Since(coordinator.currentBatch.StartedAt).Milliseconds(),
+			ElapsedMs: generatedAt.Sub(coordinator.currentBatch.StartedAt).Milliseconds(),
 		}
 	}
 	displayPending := counts.Pending - inProgress
@@ -901,7 +950,7 @@ func (coordinator *BatchCoordinator) Status() CoordinatorStatus {
 		lastError := *coordinator.lastError
 		status.LastError = &lastError
 	}
-	status.GeneratedAt = time.Now().UTC()
+	status.GeneratedAt = generatedAt
 	status.Health = deriveCoordinatorHealth(status)
 	return status
 }

@@ -210,11 +210,11 @@ func (b *ACPBackend) RunBatchIngest(ctx context.Context, batch Batch, wikiMu *sy
 func (b *ACPBackend) persistTranscript(batchID, summary string) string {
 	dir := filepath.Join(b.dataDir, "transcripts")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "transcript-write-failed"
+		return TranscriptWriteFailedMarker
 	}
 	path := filepath.Join(dir, batchID+".log")
 	if err := os.WriteFile(path, []byte(summary), 0o644); err != nil {
-		return "transcript-write-failed"
+		return TranscriptWriteFailedMarker
 	}
 	return path
 }

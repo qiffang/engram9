@@ -421,6 +421,18 @@ func (store *PendingEventStore) WriteStatuses(entries []StatusEntry) error {
 		if entry.Timestamp.IsZero() {
 			entry.Timestamp = time.Now().UTC()
 		}
+		// Closed-enum enforcement at the durable boundary (normalize, never
+		// reject: a status write must not gain a new failure path). Foreign
+		// or empty unknown reasons become "unclassified"; a missing
+		// transcript reference becomes the unavailable marker.
+		if entry.Status == "unknown" {
+			if !IsValidUnknownReason(entry.Reason) {
+				entry.Reason = UnknownReasonUnclassified
+			}
+			if entry.TranscriptPath == "" {
+				entry.TranscriptPath = TranscriptUnavailableMarker
+			}
+		}
 		normalized[index] = entry
 	}
 
@@ -560,7 +572,9 @@ func (store *PendingEventStore) RecoverFromCrash(wikiDir string) error {
 	entries := make([]StatusEntry, 0, len(ids))
 	for _, id := range ids {
 		entries = append(entries, StatusEntry{
-			EventID: id, Status: "unknown", Reason: "recovered_from_frontmatter", Recovered: true,
+			EventID: id, Status: "unknown", Reason: UnknownReasonRecoveredFromCrash,
+			// Honest marker: no turn transcript can exist across a crash.
+			TranscriptPath: TranscriptUnavailableMarker, Recovered: true,
 		})
 	}
 	if err := store.WriteStatuses(entries); err != nil {
@@ -585,7 +599,10 @@ func (store *PendingEventStore) UnknownByReason() map[string]int {
 			continue
 		}
 		reason := status.Reason
-		if reason == "" {
+		if !IsValidUnknownReason(reason) {
+			// Legacy rows predating closed-enum enforcement (including empty
+			// reasons) clamp to unclassified — output keys are always a
+			// subset of the enum.
 			reason = UnknownReasonUnclassified
 		}
 		counts[reason]++

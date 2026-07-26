@@ -324,7 +324,7 @@ func TestPendingEventStoreCrashRecoveryIsConservative(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(wikiDir, "semantic", "page.md"), []byte("<!-- compiled_from: a, terminal -->\n# Page\n"), 0o644))
 
 	require.NoError(t, store.RecoverFromCrash(wikiDir))
-	require.Equal(t, EventStatus{Status: "unknown", Reason: "recovered_from_frontmatter"}, mustEventStatus(t, store, "a"))
+	require.Equal(t, EventStatus{Status: "unknown", Reason: UnknownReasonRecoveredFromCrash, TranscriptPath: TranscriptUnavailableMarker}, mustEventStatus(t, store, "a"))
 	require.Equal(t, EventStatus{Status: "pending"}, mustEventStatus(t, store, "b"))
 	require.Equal(t, EventStatus{Status: "integrated"}, mustEventStatus(t, store, "terminal"))
 }
@@ -398,4 +398,57 @@ func TestPendingEventStoreUnknownByReason(t *testing.T) {
 
 	status := mustEventStatus(t, store, "ev-a")
 	require.Equal(t, "transcripts/b1.log", status.TranscriptPath, "transcript path must round-trip through the store")
+}
+
+func TestWriteStatusesNormalizesUnknownAtStoreBoundary(t *testing.T) {
+	epoch := "2026-07-19T12:00:00Z"
+	source := &memoryEventSource{events: []storage.Event{
+		{ID: "ev-bogus", Timestamp: "2026-07-19T12:00:01Z"},
+		{ID: "ev-empty", Timestamp: "2026-07-19T12:00:02Z"},
+		{ID: "ev-valid", Timestamp: "2026-07-19T12:00:03Z"},
+	}}
+	store, err := NewPendingEventStore(t.TempDir(), source, StoreConfig{BootstrapEpoch: epoch})
+	require.NoError(t, err)
+	require.NoError(t, store.WriteStatuses([]StatusEntry{
+		{EventID: "ev-bogus", Status: "unknown", Reason: "bogus-freeform", TranscriptPath: ""},
+		{EventID: "ev-empty", Status: "unknown"},
+		{EventID: "ev-valid", Status: "unknown", Reason: UnknownReasonMalformedVerdict, TranscriptPath: "transcripts/b.log"},
+	}))
+
+	bogus := mustEventStatus(t, store, "ev-bogus")
+	require.Equal(t, UnknownReasonUnclassified, bogus.Reason, "foreign reason must normalize to unclassified")
+	require.Equal(t, TranscriptUnavailableMarker, bogus.TranscriptPath, "empty transcript must normalize to the marker")
+	empty := mustEventStatus(t, store, "ev-empty")
+	require.Equal(t, UnknownReasonUnclassified, empty.Reason)
+	require.Equal(t, TranscriptUnavailableMarker, empty.TranscriptPath)
+	valid := mustEventStatus(t, store, "ev-valid")
+	require.Equal(t, UnknownReasonMalformedVerdict, valid.Reason, "enum reasons pass through untouched")
+	require.Equal(t, "transcripts/b.log", valid.TranscriptPath)
+
+	for reason := range store.UnknownByReason() {
+		require.True(t, IsValidUnknownReason(reason), "UnknownByReason keys must be enum members, got %q", reason)
+	}
+}
+
+func TestRecoverFromCrashRowsUseClosedEnum(t *testing.T) {
+	epoch := "2026-07-19T12:00:00Z"
+	source := &memoryEventSource{events: []storage.Event{
+		{ID: "evt-crash", Timestamp: "2026-07-19T12:00:01Z"},
+	}}
+	dataDir := t.TempDir()
+	store, err := NewPendingEventStore(dataDir, source, StoreConfig{BootstrapEpoch: epoch})
+	require.NoError(t, err)
+
+	wikiDir := filepath.Join(dataDir, "wiki")
+	require.NoError(t, os.MkdirAll(wikiDir, 0o755))
+	page := "<!--\ncompiled_from: evt-crash\n-->\nbody\n"
+	require.NoError(t, os.WriteFile(filepath.Join(wikiDir, "page.md"), []byte(page), 0o644))
+
+	require.NoError(t, store.RecoverFromCrash(wikiDir))
+
+	status := mustEventStatus(t, store, "evt-crash")
+	require.Equal(t, "unknown", status.Status)
+	require.Equal(t, UnknownReasonRecoveredFromCrash, status.Reason)
+	require.Equal(t, TranscriptUnavailableMarker, status.TranscriptPath, "no fabricated path across a crash")
+	require.Equal(t, 1, store.UnknownByReason()[UnknownReasonRecoveredFromCrash])
 }

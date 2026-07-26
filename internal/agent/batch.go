@@ -60,11 +60,33 @@ type EventResult struct {
 // Closed reason enum for "unknown" outcomes. Classification failure maps to
 // UnknownReasonUnclassified — an empty reason is structurally impossible.
 const (
-	UnknownReasonNoPerEventVerdict = "no_per_event_verdict" // agent output has verdict lines, none for this event
-	UnknownReasonMalformedVerdict  = "malformed_verdict"    // verdict lines present but none match batch event IDs
-	UnknownReasonTurnEndedNoOutput = "turn_ended_no_output" // agent turn completed with empty output
-	UnknownReasonParserError       = "parser_error"         // verdict parsing failed structurally
-	UnknownReasonUnclassified      = "unclassified"         // fallback — never ""
+	UnknownReasonNoPerEventVerdict  = "no_per_event_verdict"       // agent output has verdict lines, none for this event
+	UnknownReasonMalformedVerdict   = "malformed_verdict"          // verdict lines present but none match batch event IDs
+	UnknownReasonTurnEndedNoOutput  = "turn_ended_no_output"       // agent turn completed with empty output
+	UnknownReasonParserError        = "parser_error"               // verdict parsing failed structurally
+	UnknownReasonRecoveredFromCrash = "recovered_from_frontmatter" // event was in-flight at process death; frontmatter shows page contact but no verdict
+	UnknownReasonUnclassified       = "unclassified"               // fallback — never ""
+)
+
+// IsValidUnknownReason reports whether reason is a member of the closed
+// unknown-reason enum. The store normalizes anything else to
+// UnknownReasonUnclassified at its write AND read boundaries.
+func IsValidUnknownReason(reason string) bool {
+	switch reason {
+	case UnknownReasonNoPerEventVerdict, UnknownReasonMalformedVerdict,
+		UnknownReasonTurnEndedNoOutput, UnknownReasonParserError,
+		UnknownReasonRecoveredFromCrash, UnknownReasonUnclassified:
+		return true
+	default:
+		return false
+	}
+}
+
+// Transcript path markers used when no real transcript file exists. Exported
+// so consumers can match them without magic strings.
+const (
+	TranscriptUnavailableMarker = "transcript-unavailable"  // caller had no transcript to persist
+	TranscriptWriteFailedMarker = "transcript-write-failed" // persistence attempted and failed
 )
 
 func NormalizeToPendingEvent(event storage.Event) PendingEvent {
@@ -264,7 +286,7 @@ func parseEventResults(batch Batch, summary string, transcriptPath string) []Eve
 		defaultReason = UnknownReasonUnclassified
 	}
 	if transcriptPath == "" {
-		transcriptPath = "transcript-unavailable"
+		transcriptPath = TranscriptUnavailableMarker
 	}
 
 	results := make([]EventResult, 0, len(batch.Events))
