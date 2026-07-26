@@ -632,8 +632,8 @@ func (coordinator *BatchCoordinator) batchTimeout(batch Batch) time.Duration {
 	if batchSizedTimeout > timeout {
 		timeout = batchSizedTimeout
 	}
-	if timeout > 10*time.Minute {
-		timeout = 10 * time.Minute
+	if timeout > MaxBatchCap {
+		timeout = MaxBatchCap
 	}
 	if timeout <= 0 {
 		timeout = DefaultACPTurnTimeout
@@ -914,8 +914,10 @@ func (coordinator *BatchCoordinator) Status() CoordinatorStatus {
 // 2026-07-26, task #66).
 const wallClockStuckMultiple = 2
 
-// maxBatchCap mirrors the hard ceiling in batchTimeout.
-const maxBatchCap = 10 * time.Minute
+// MaxBatchCap is the hard per-batch wall-clock ceiling. batchTimeout clamps
+// to it and the wall-clock stuck arm derives its bound from it — single
+// source, so the two can never drift apart.
+const MaxBatchCap = 10 * time.Minute
 
 func deriveCoordinatorHealth(status CoordinatorStatus) string {
 	effectivePending := status.Pending
@@ -932,7 +934,7 @@ func deriveCoordinatorHealth(status CoordinatorStatus) string {
 	if actionablePending > 0 && status.InProgress == 0 && status.LastFlush != nil && status.LastFlush.BatchesSucceeded == 0 {
 		return "stuck"
 	}
-	if status.CurrentBatch != nil && status.GeneratedAt.Sub(status.CurrentBatch.StartedAt) > wallClockStuckMultiple*maxBatchCap {
+	if status.CurrentBatch != nil && status.GeneratedAt.Sub(status.CurrentBatch.StartedAt) > wallClockStuckMultiple*MaxBatchCap {
 		return "stuck"
 	}
 	if status.InProgress > 0 || actionablePending > 0 {

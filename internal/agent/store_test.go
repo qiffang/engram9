@@ -373,3 +373,29 @@ func TestPendingEventStoreBootstrapMethodRefusesExistingStatus(t *testing.T) {
 	require.NoError(t, err)
 	require.ErrorContains(t, store.Bootstrap(time.Time{}), "already exists")
 }
+
+func TestPendingEventStoreUnknownByReason(t *testing.T) {
+	epoch := "2026-07-19T12:00:00Z"
+	source := &memoryEventSource{events: []storage.Event{
+		{ID: "ev-a", Timestamp: "2026-07-19T12:00:01Z"},
+		{ID: "ev-b", Timestamp: "2026-07-19T12:00:02Z"},
+		{ID: "ev-c", Timestamp: "2026-07-19T12:00:03Z"},
+		{ID: "ev-d", Timestamp: "2026-07-19T12:00:04Z"},
+	}}
+	store, err := NewPendingEventStore(t.TempDir(), source, StoreConfig{BootstrapEpoch: epoch})
+	require.NoError(t, err)
+	require.NoError(t, store.WriteStatuses([]StatusEntry{
+		{EventID: "ev-a", Status: "unknown", Reason: UnknownReasonNoPerEventVerdict, TranscriptPath: "transcripts/b1.log"},
+		{EventID: "ev-b", Status: "unknown", Reason: UnknownReasonNoPerEventVerdict, TranscriptPath: "transcripts/b1.log"},
+		{EventID: "ev-c", Status: "unknown"}, // legacy empty reason
+		{EventID: "ev-d", Status: "integrated"},
+	}))
+
+	counts := store.UnknownByReason()
+	require.Equal(t, 2, counts[UnknownReasonNoPerEventVerdict])
+	require.Equal(t, 1, counts[UnknownReasonUnclassified], "legacy empty reason must group under unclassified")
+	require.Len(t, counts, 2, "integrated events must not appear")
+
+	status := mustEventStatus(t, store, "ev-a")
+	require.Equal(t, "transcripts/b1.log", status.TranscriptPath, "transcript path must round-trip through the store")
+}

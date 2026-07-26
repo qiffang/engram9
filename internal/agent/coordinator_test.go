@@ -625,7 +625,7 @@ func TestStatusWallClockStuckArm(t *testing.T) {
 	// zero-success arm (defense-in-depth vs cap-enforcement bugs).
 	coordinator.currentBatch = &ActiveBatchState{
 		BatchID: "hung", EventIDs: []string{"event-00"},
-		StartedAt:  time.Now().UTC().Add(-wallClockStuckMultiple*maxBatchCap - time.Second),
+		StartedAt:  time.Now().UTC().Add(-wallClockStuckMultiple*MaxBatchCap - time.Second),
 		BatchIndex: 1, TotalBatches: 1,
 	}
 	status = coordinator.Status()
