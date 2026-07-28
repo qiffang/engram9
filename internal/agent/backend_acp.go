@@ -14,8 +14,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/qiffang/engram9/internal/storage"
 )
 
 const (
@@ -219,17 +217,8 @@ func (b *ACPBackend) persistTranscript(batchID, summary string) string {
 	return path
 }
 
-func (b *ACPBackend) RunCompile(_ context.Context, _ uint64) (CompileResult, error) {
-	// ACP compile is not yet supported: MCP agent mode only exposes wiki tools
-	// (read_wiki_index, read_wiki_page, write_wiki_page, search_wiki) but compile
-	// requires read_events_since, archive_wiki_page, and rebuild_index.
-	// Until a compile-mode MCP tool set is implemented, compile stays on LLM.
-	return CompileResult{}, ErrNotImplemented
-}
-
-func (b *ACPBackend) RunQuery(_ context.Context, _ string, _ map[string]string, _ []storage.Event) (QueryResult, error) {
-	return QueryResult{}, ErrNotImplemented
-}
+// RunCompile is implemented in backend_acp_compile.go.
+// RunQuery is implemented in backend_acp_query.go.
 
 func (b *ACPBackend) Close() error {
 	return nil
@@ -259,7 +248,26 @@ func (b *ACPBackend) runACPTurn(ctx context.Context, prompt string, valOpts Vali
 	return result.Summary, nil
 }
 
+// acpTurnOptions carries per-turn customization for runACPTurnFull. The
+// default (zero value) reproduces the ingest/batch behavior: agent-mode MCP
+// server, validate, merge.
+type acpTurnOptions struct {
+	// mcpArgs overrides the engram9-mcp launch args. Empty ⇒ agent mode.
+	mcpArgs func(stagingDir string) []string
+	// preMerge runs after validation succeeds and BEFORE merge. Returning an
+	// error aborts the turn with staging discarded (no merge) — compile uses
+	// this to validate the receipt so an invalid receipt leaves the store
+	// entirely unchanged (invariant 11 / A2).
+	preMerge func(stagingDir string) error
+	// skipMerge leaves the store untouched even on success (query is read-only).
+	skipMerge bool
+}
+
 func (b *ACPBackend) runACPTurnFull(ctx context.Context, prompt string, valOpts ValidateOptions) (TurnResult, error) {
+	return b.runACPTurnFullOpts(ctx, prompt, valOpts, acpTurnOptions{})
+}
+
+func (b *ACPBackend) runACPTurnFullOpts(ctx context.Context, prompt string, valOpts ValidateOptions, opts acpTurnOptions) (TurnResult, error) {
 
 	// 1. Create staging directory and copy data.
 	stagingDir, err := os.MkdirTemp("", "engram9-acp-staging-*")
@@ -334,7 +342,11 @@ func (b *ACPBackend) runACPTurnFull(ctx context.Context, prompt string, valOpts 
 	// 4. Send session/new with MCP config.
 	// acpmux expects MCP server fields at top level (type, name, command, args),
 	// NOT nested under a "transport" key.
-	sessionReq := newACPSessionRequest(stagingDir)
+	mcpArgs := []string{"-data", stagingDir, "-mode", "agent"}
+	if opts.mcpArgs != nil {
+		mcpArgs = opts.mcpArgs(stagingDir)
+	}
+	sessionReq := newACPSessionRequestWithArgs(stagingDir, mcpArgs)
 	if err := sendACPRequest(stdin, sessionReq); err != nil {
 		return TurnResult{}, fmt.Errorf("send session/new: %w", err)
 	}
@@ -421,7 +433,19 @@ func (b *ACPBackend) runACPTurnFull(ctx context.Context, prompt string, valOpts 
 		return TurnResult{Summary: summary, Violations: violations}, nil
 	}
 
-	// 8. Merge staging wiki -> production.
+	// 7b. preMerge gate (compile receipt validation): an error here aborts the
+	// turn with staging discarded (deferred RemoveAll), so the store — wiki,
+	// archive, index, .meta, cursor — is left exactly as before (invariant 11).
+	if opts.preMerge != nil {
+		if err := opts.preMerge(stagingDir); err != nil {
+			return TurnResult{Summary: summary}, err
+		}
+	}
+
+	// 8. Merge staging wiki -> production (skipped for read-only query turns).
+	if opts.skipMerge {
+		return TurnResult{Summary: summary, Merged: false}, nil
+	}
 	if err := mergeWiki(stagingDir, b.dataDir); err != nil {
 		return TurnResult{Summary: summary}, fmt.Errorf("merge staging: %w", err)
 	}
@@ -466,6 +490,13 @@ func acpmuxArgs(provider string) []string {
 }
 
 func newACPSessionRequest(stagingDir string) acpRequest {
+	return newACPSessionRequestWithArgs(stagingDir, []string{"-data", stagingDir, "-mode", "agent"})
+}
+
+// newACPSessionRequestWithArgs builds a session/new request whose engram9 MCP
+// server is launched with the given args. Compile and query modes pass their
+// mode plus (for compile) -turn-id/-event-bound/-receipt here.
+func newACPSessionRequestWithArgs(stagingDir string, mcpArgs []string) acpRequest {
 	return acpRequest{
 		JSONRPC: "2.0",
 		ID:      json.RawMessage(`2`),
@@ -477,7 +508,7 @@ func newACPSessionRequest(stagingDir string) acpRequest {
 					"name":    "engram9",
 					"type":    "stdio",
 					"command": "engram9-mcp",
-					"args":    []string{"-data", stagingDir, "-mode", "agent"},
+					"args":    mcpArgs,
 				},
 			},
 		}),

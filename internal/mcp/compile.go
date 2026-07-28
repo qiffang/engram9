@@ -8,29 +8,19 @@ import (
 	"github.com/qiffang/engram9/internal/storage"
 )
 
-// ReceiptEntry is one line in the compile receipt file. engram9-mcp appends one
-// entry per SUCCESSFUL read_events_since call in compile mode; the handler reads
-// them back after the turn to validate cursor advancement.
-//
-// The protocol (design #41 §5, adversary-2 D1/D2):
-//   - TurnID stamps freshness: the handler accepts only entries whose TurnID
-//     equals the nonce it generated for THIS turn, so a stale receipt from a
-//     timed-out prior turn can never validate regardless of cursor coincidence.
-//   - Exactly one entry with the current TurnID is required; zero →
-//     unknown(no_valid_receipt), more than one → unknown(multi_read).
-//   - CursorIn must equal the handler's expected start cursor.
-type ReceiptEntry struct {
-	TurnID    string `json:"turn_id"`
-	CursorIn  uint64 `json:"cursor_in"`
-	NewCursor uint64 `json:"new_cursor"`
-}
-
 // appendReceipt appends a receipt entry as one JSON line to the receipt file.
+// The receipt schema (turn_id, cursor_in, new_cursor) is defined by the handler
+// side as agent.CompileReceiptEntry; here we emit the same wire shape without
+// importing that package (mcp is imported BY agent, so it cannot import agent).
 func (s *Server) appendReceipt(cursorIn, newCursor uint64) error {
 	if s.receiptPath == "" {
 		return fmt.Errorf("compile mode: no receipt path configured")
 	}
-	entry := ReceiptEntry{TurnID: s.turnID, CursorIn: cursorIn, NewCursor: newCursor}
+	entry := struct {
+		TurnID    string `json:"turn_id"`
+		CursorIn  uint64 `json:"cursor_in"`
+		NewCursor uint64 `json:"new_cursor"`
+	}{TurnID: s.turnID, CursorIn: cursorIn, NewCursor: newCursor}
 	line, err := json.Marshal(entry)
 	if err != nil {
 		return err

@@ -2,29 +2,16 @@ package agent
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
-	"errors"
 	"reflect"
 	"strings"
 	"testing"
 )
 
-func TestACPBackendRunQueryReturnsErrNotImplemented(t *testing.T) {
-	b := &ACPBackend{}
-	_, err := b.RunQuery(context.Background(), "test", nil, nil)
-	if !errors.Is(err, ErrNotImplemented) {
-		t.Fatalf("ACPBackend.RunQuery() error=%v, want ErrNotImplemented", err)
-	}
-}
-
-func TestACPBackendRunCompileReturnsErrNotImplemented(t *testing.T) {
-	b := &ACPBackend{}
-	_, err := b.RunCompile(context.Background(), 0)
-	if !errors.Is(err, ErrNotImplemented) {
-		t.Fatalf("ACPBackend.RunCompile() error=%v, want ErrNotImplemented", err)
-	}
-}
+// RunCompile / RunQuery are now implemented (canon9-ai #41). Their deterministic
+// logic (receipt validation, recall injection) is covered by the tests in
+// backend_acp_compile_test.go and backend_acp_query_test.go; the full ACP turn
+// requires a real acpmux+claude E2E per the #41 §10 gate.
 
 func TestNewACPBackendRejectsNonClaudeProvider(t *testing.T) {
 	_, err := NewACPBackend(t.TempDir(), ACPBackendConfig{Provider: "codex"})
