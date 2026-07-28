@@ -218,6 +218,36 @@ func (f *FS) ReadWikiPage(path string) (*WikiPage, error) {
 	}, nil
 }
 
+// ReadWikiPageReadOnly reads a wiki page and its sidecar with NO store
+// mutation: it never writes access telemetry back to the sidecar. The query
+// capability requires zero store mutation (invariant 12 / adversary-1 A3), so
+// it uses this path instead of ReadWikiPage. The per-page lock is still taken
+// (read lock domain) to avoid reading a torn write, but nothing is written.
+func (f *FS) ReadWikiPageReadOnly(path string) (*WikiPage, error) {
+	if err := validateWikiPath(path); err != nil {
+		return nil, err
+	}
+
+	mu := f.lockPage(path)
+	mu.Lock()
+	defer mu.Unlock()
+
+	fullPath := filepath.Join(f.wikiDir(), path)
+	content, err := os.ReadFile(fullPath)
+	if err != nil {
+		return nil, fmt.Errorf("read page %s: %w", path, err)
+	}
+
+	meta := f.readSidecar(path)
+	// Intentionally NO telemetry writeback: zero store mutation.
+
+	return &WikiPage{
+		Path:    path,
+		Content: string(content),
+		Meta:    meta,
+	}, nil
+}
+
 // SearchWiki does a case-insensitive text search across wiki pages,
 // including archived pages (per design: archive is searchable for recovery).
 func (f *FS) SearchWiki(query string) ([]SearchResult, error) {

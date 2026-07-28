@@ -72,6 +72,12 @@ func (b *BundleFS) ReadWikiPage(path string) (*WikiPage, error) {
 	}, nil
 }
 
+// ReadWikiPageReadOnly is identical to ReadWikiPage for a bundle: the bundle
+// store never writes access telemetry, so the read path is already mutation-free.
+func (b *BundleFS) ReadWikiPageReadOnly(path string) (*WikiPage, error) {
+	return b.ReadWikiPage(path)
+}
+
 func (b *BundleFS) SearchWiki(query string) ([]SearchResult, error) {
 	var results []SearchResult
 	queryLower := strings.ToLower(query)

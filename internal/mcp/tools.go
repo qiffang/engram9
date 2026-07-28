@@ -135,11 +135,68 @@ var AgentMCPTools = []mcpTool{
 	},
 }
 
+// readEventsSinceTool, archiveWikiPageTool, rebuildIndexTool are the extra
+// tools the compile capability needs beyond the agent (ingest) surface.
+var readEventsSinceTool = mcpTool{
+	Name:        "read_events_since",
+	Description: "Read unprocessed raw events after the given cursor. Returns the events and a new_cursor. Compile agents call this exactly once per cycle to fetch the batch to distill.",
+	InputSchema: mustJSON(map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"cursor": map[string]any{"type": "integer", "description": "Start cursor (exclusive lower bound); pass the compile cursor provided in the prompt"},
+		},
+		"required": []string{"cursor"},
+	}),
+}
+
+var archiveWikiPageTool = mcpTool{
+	Name:        "archive_wiki_page",
+	Description: "Archive a wiki page (move it out of active wiki) with a reason. Use during sleep-pruning per memory-type rules.",
+	InputSchema: mustJSON(map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"path":   map[string]any{"type": "string", "description": "Relative path within wiki/ (e.g. episodic/foo.md)"},
+			"reason": map[string]any{"type": "string", "description": "Why the page is being archived"},
+		},
+		"required": []string{"path", "reason"},
+	}),
+}
+
+var rebuildIndexTool = mcpTool{
+	Name:        "rebuild_index",
+	Description: "Regenerate the wiki index (routing table) after significant page changes. Call at the end of a compile cycle.",
+	InputSchema: mustJSON(map[string]any{
+		"type":       "object",
+		"properties": map[string]any{},
+	}),
+}
+
+// CompileMCPTools is the compile capability surface: the agent-mode wiki tools
+// plus read_events_since, archive_wiki_page, and rebuild_index. The tool
+// surface IS the capability boundary (invariant 1).
+var CompileMCPTools = append(append([]mcpTool{}, AgentMCPTools...),
+	readEventsSinceTool, archiveWikiPageTool, rebuildIndexTool)
+
+// QueryMCPTools is the strictly read-only query surface: NO write tool is
+// registered at all (invariant 1/12). read_wiki_page here maps to a read-only
+// store read that writes no access telemetry.
+var QueryMCPTools = []mcpTool{
+	AgentMCPTools[0], // read_wiki_index
+	AgentMCPTools[1], // read_wiki_page
+	AgentMCPTools[3], // search_wiki
+}
+
 // executeTool dispatches an MCP tool call to the storage layer.
 func (s *Server) executeTool(name string, args map[string]any) (string, error) {
 	// Agent mode tools.
 	if s.mode == ModeAgent {
 		return s.executeAgentTool(name, args)
+	}
+	if s.mode == ModeCompile {
+		return s.executeCompileTool(name, args)
+	}
+	if s.mode == ModeQuery {
+		return s.executeQueryTool(name, args)
 	}
 
 	// Consumption mode tools.
@@ -251,6 +308,64 @@ func (s *Server) execAgentSearchWiki(args map[string]any) (string, error) {
 		return "No results found.", nil
 	}
 	data, _ := json.Marshal(results)
+	return string(data), nil
+}
+
+// executeCompileTool dispatches compile-mode tool calls. It reuses the agent
+// wiki tools (read/write/search) and adds read_events_since (snapshot-bounded +
+// receipt-emitting), archive_wiki_page, and rebuild_index.
+func (s *Server) executeCompileTool(name string, args map[string]any) (string, error) {
+	switch name {
+	case "read_wiki_index":
+		return s.execAgentReadWikiIndex()
+	case "read_wiki_page":
+		return s.execAgentReadWikiPage(args)
+	case "write_wiki_page":
+		return s.execAgentWriteWikiPage(args)
+	case "search_wiki":
+		return s.execAgentSearchWiki(args)
+	case "read_events_since":
+		return s.execCompileReadEventsSince(args)
+	case "archive_wiki_page":
+		return s.execCompileArchiveWikiPage(args)
+	case "rebuild_index":
+		return s.execCompileRebuildIndex()
+	default:
+		return "", fmt.Errorf("unknown tool: %s", name)
+	}
+}
+
+// executeQueryTool dispatches read-only query tool calls. read_wiki_page uses
+// the mutation-free store read so a query turn writes zero store state,
+// including .meta telemetry (invariant 12).
+func (s *Server) executeQueryTool(name string, args map[string]any) (string, error) {
+	switch name {
+	case "read_wiki_index":
+		return s.execAgentReadWikiIndex()
+	case "read_wiki_page":
+		return s.execQueryReadWikiPage(args)
+	case "search_wiki":
+		return s.execAgentSearchWiki(args)
+	default:
+		return "", fmt.Errorf("unknown tool: %s", name)
+	}
+}
+
+// execQueryReadWikiPage reads a page with zero store mutation (no .meta
+// access-telemetry writeback).
+func (s *Server) execQueryReadWikiPage(args map[string]any) (string, error) {
+	path, ok := args["path"].(string)
+	if !ok || path == "" {
+		return "", fmt.Errorf("path is required")
+	}
+	if err := validatePath(path); err != nil {
+		return "", err
+	}
+	page, err := s.store.ReadWikiPageReadOnly(path)
+	if err != nil {
+		return "", err
+	}
+	data, _ := json.Marshal(page)
 	return string(data), nil
 }
 
