@@ -57,8 +57,13 @@ func (s *Server) execCompileReadEventsSince(args map[string]any) (string, error)
 	// Snapshot-bound: drop any events at or beyond the pre-turn event bound, and
 	// never report a new_cursor past it. events are 0-indexed from cursorIn, so
 	// an event at absolute index i lives at page.Events[i-cursorIn].
+	//
+	// eventBound is ALWAYS applied (compile mode requires -event-bound). In
+	// particular eventBound==0 means "zero events visible" — it clamps to an empty
+	// page with new_cursor=0, NOT "unbounded". (Previously a `> 0` guard treated 0
+	// as no-bound, contradicting the required-flag contract in cmd/engram9-mcp.)
 	bounded := page
-	if s.eventBound > 0 && page.NewCursor > s.eventBound {
+	if page.NewCursor > s.eventBound {
 		keep := 0
 		if s.eventBound > cursorIn {
 			keep = int(s.eventBound - cursorIn)

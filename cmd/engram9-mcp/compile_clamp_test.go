@@ -126,6 +126,83 @@ func TestCompileReadEventsSnapshotBoundClamp(t *testing.T) {
 	}
 }
 
+// TestCompileEventBoundZeroServesZeroEvents locks the explicit -event-bound 0
+// contract: it means "zero events visible", NOT "unbounded". With 5 events in
+// the store and -event-bound 0, read_events_since must return an EMPTY page with
+// new_cursor=0. A regression to the old `if eventBound > 0` guard (treating 0 as
+// no-bound) would serve all 5 events and FAIL this test — the exact gap the
+// required-flag contract in cmd/engram9-mcp promises to close.
+func TestCompileEventBoundZeroServesZeroEvents(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "engram9-mcp")
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, out)
+	}
+
+	dataDir := t.TempDir()
+	store, err := storage.NewFS(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		if _, err := store.AppendEvent(storage.Event{
+			ID: eventID(i), Content: "c " + eventID(i), Actor: "user", Source: "test",
+			Durability: "long-term", Actionability: "informational",
+			SourceType: "user", EvidenceKind: "direct_statement", TrustTier: 1,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	receiptPath := filepath.Join(t.TempDir(), "receipt.jsonl")
+	cmd := exec.Command(bin, "-data", dataDir, "-mode", "compile",
+		"-turn-id", "TURN_ZERO", "-event-bound", "0", "-receipt", receiptPath)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
+
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 1<<20), 1<<20)
+	writeRPC(t, stdin, 1, "initialize", map[string]any{"protocolVersion": 1})
+	readRPCResult(t, scanner, 1)
+	writeRPC(t, stdin, 2, "tools/call", map[string]any{
+		"name": "read_events_since", "arguments": map[string]any{"cursor": 0},
+	})
+	result := readRPCResult(t, scanner, 2)
+
+	var callResult struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+		IsError bool `json:"isError"`
+	}
+	if err := json.Unmarshal(result, &callResult); err != nil {
+		t.Fatalf("decode: %v (%s)", err, result)
+	}
+	if callResult.IsError || len(callResult.Content) == 0 {
+		t.Fatalf("read_events_since errored: %s", result)
+	}
+	var page storage.EventsPage
+	if err := json.Unmarshal([]byte(callResult.Content[0].Text), &page); err != nil {
+		t.Fatalf("decode page: %v", err)
+	}
+	if len(page.Events) != 0 {
+		t.Fatalf("-event-bound 0 must serve ZERO events, got %d (regression: treating 0 as unbounded)", len(page.Events))
+	}
+	if page.NewCursor != 0 {
+		t.Fatalf("-event-bound 0 must report new_cursor=0, got %d", page.NewCursor)
+	}
+}
+
 func eventID(i int) string {
 	return "evt_" + string(rune('a'+i))
 }
