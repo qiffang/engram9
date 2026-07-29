@@ -49,18 +49,28 @@ func runServe(args []string) {
 	_ = flags.Parse(args)
 
 	// Resolve backend configuration.
+	// Default to ACP (Claude Code / Codex) for every capability: the wiki flow
+	// must run through an agent by default, NOT the OpenAI-compatible apikey
+	// path. LLM is only used when a capability is EXPLICITLY set to "llm"; it is
+	// never a silent fallback.
 	wikiBackend := os.Getenv("WIKI_BACKEND")
 	if wikiBackend == "" {
-		wikiBackend = "llm"
+		wikiBackend = "acp"
+	}
+	compileBackend := os.Getenv("COMPILE_BACKEND")
+	if compileBackend == "" {
+		compileBackend = "acp"
 	}
 	queryBackend := os.Getenv("QUERY_BACKEND")
 	if queryBackend == "" {
-		queryBackend = "llm"
+		queryBackend = "acp"
 	}
 
-	// Determine if LLM is needed.
-	// LLM is required when: wiki backend is "llm" OR query backend is "llm".
-	needLLM := wikiBackend == "llm" || queryBackend == "llm"
+	// Determine if LLM is needed (I5: lazy LLM client construction).
+	// LLM is required when ANY of ingest/compile/query is on the "llm" backend.
+	// With all three on "acp", no LLM client is constructed and no LLM API keys
+	// are read — the zero-apikey completeness invariant.
+	needLLM := wikiBackend == "llm" || compileBackend == "llm" || queryBackend == "llm"
 
 	var llm agent.LLM
 	llmProvider := ""
@@ -111,12 +121,16 @@ func runServe(args []string) {
 	}
 
 	// Build ACP config if needed.
+	// Build the ACP config when ANY capability is on the acp backend (ingest,
+	// compile, or query — all default to acp).
+	needACP := wikiBackend == "acp" || compileBackend == "acp" || queryBackend == "acp"
 	var acpCfg *agent.ACPBackendConfig
-	if wikiBackend == "acp" {
+	if needACP {
+		// Default provider is Claude Code; Codex is opt-in via ACP_PROVIDER=codex
+		// once its capability matrix / e2e passes (#41).
 		acpProvider := os.Getenv("ACP_PROVIDER")
 		if acpProvider == "" {
-			fmt.Fprintln(os.Stderr, "error: ACP_PROVIDER is required when WIKI_BACKEND=acp")
-			os.Exit(1)
+			acpProvider = "claude"
 		}
 		acpmuxCmd := os.Getenv("ACPMUX_COMMAND")
 		if acpmuxCmd == "" {
@@ -141,7 +155,7 @@ func runServe(args []string) {
 			MaxDiffBytes:   maxDiffBytes,
 			AdditionalDirs: os.Getenv("ACP_ADDITIONAL_DIRS"),
 		}
-		log.Printf("WIKI_BACKEND=acp (provider: %s, acpmux: %s, turn_timeout: %s)", acpProvider, acpmuxCmd, turnTimeout)
+		log.Printf("ACP backend (provider: %s, acpmux: %s, turn_timeout: %s) — ingest=%s compile=%s query=%s", acpProvider, acpmuxCmd, turnTimeout, wikiBackend, compileBackend, queryBackend)
 	}
 
 	retryAttempts := *llmRetryAttempts
@@ -162,6 +176,7 @@ func runServe(args []string) {
 		LLMModel:                     llmModel,
 		LLMBaseURL:                   llmBaseURL,
 		WikiBackend:                  wikiBackend,
+		CompileBackend:               compileBackend,
 		QueryBackend:                 queryBackend,
 		ACPConfig:                    acpCfg,
 	})
@@ -178,7 +193,7 @@ func runServe(args []string) {
 	}
 
 	log.Printf("engram9 listening on %s (data: %s)", *addr, *dataDir)
-	log.Printf("engram9 backends: wiki_backend=%s query_backend=%s", wikiBackend, queryBackend)
+	log.Printf("engram9 backends: ingest=%s compile=%s query=%s", wikiBackend, compileBackend, queryBackend)
 	log.Printf("engram9 runtime: max_tool_loops=%d max_repeated_read_only_tool_calls=%d max_invalid_tool_calls=%d ingest_timeout=%s max_concurrent_integrations=%d",
 		handler.MaxToolLoops(),
 		handler.MaxRepeatedReadOnlyToolCalls(),

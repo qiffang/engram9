@@ -38,6 +38,9 @@ func newTestHandler(t *testing.T) *Handler {
 	t.Helper()
 	llm := &mockLLM{response: "Memory stored successfully."}
 	h, err := NewWithOptions(t.TempDir(), llm, Options{
+		WikiBackend:               "llm",
+		CompileBackend:            "llm",
+		QueryBackend:              "llm",
 		IngestTimeout:             time.Second,
 		MaxConcurrentIntegrations: defaultMaxConcurrentIntegrations,
 		LLMRetryAttempts:          agent.DefaultLLMRetryAttempts,
@@ -745,6 +748,9 @@ func (f *failingLLM) Call(_ context.Context, _ agent.LLMRequest) (*agent.LLMResp
 
 func TestIngestErrorCountIncrementsOnFailure(t *testing.T) {
 	h, err := NewWithOptions(t.TempDir(), &failingLLM{}, Options{
+		WikiBackend:               "llm",
+		CompileBackend:            "llm",
+		QueryBackend:              "llm",
 		IngestTimeout:             time.Second,
 		MaxConcurrentIntegrations: 1,
 	})
@@ -811,6 +817,9 @@ func (m *activeCountingLLM) recordMaxActive(active int64) {
 func TestRememberLimitsConcurrentIntegrations(t *testing.T) {
 	llm := &activeCountingLLM{delay: 20 * time.Millisecond}
 	h, err := NewWithOptions(t.TempDir(), llm, Options{
+		WikiBackend:               "llm",
+		CompileBackend:            "llm",
+		QueryBackend:              "llm",
 		IngestTimeout:             time.Second,
 		MaxConcurrentIntegrations: 1,
 	})
@@ -860,15 +869,19 @@ func TestRememberMethodNotAllowed(t *testing.T) {
 	}
 }
 
-func TestNewWithOptionsRejectsQueryBackendACP(t *testing.T) {
+// QUERY_BACKEND=acp is now supported (canon9-ai #41); without ACP config it
+// must fail fast (no silent LLM fallback), not be rejected as unsupported.
+func TestNewWithOptionsQueryBackendACPRequiresConfig(t *testing.T) {
 	llm := &mockLLM{response: "ok"}
 	_, err := NewWithOptions(t.TempDir(), llm, Options{
-		QueryBackend: "acp",
+		WikiBackend:    "llm",
+		CompileBackend: "llm",
+		QueryBackend:   "acp",
 	})
 	if err == nil {
-		t.Fatal("expected error for QUERY_BACKEND=acp")
+		t.Fatal("expected error for QUERY_BACKEND=acp without ACP config")
 	}
-	if !strings.Contains(err.Error(), "QUERY_BACKEND=acp is not yet supported") {
+	if !strings.Contains(err.Error(), "ACP configuration is missing") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
@@ -876,7 +889,9 @@ func TestNewWithOptionsRejectsQueryBackendACP(t *testing.T) {
 func TestNewWithOptionsRejectsUnknownWikiBackend(t *testing.T) {
 	llm := &mockLLM{response: "ok"}
 	_, err := NewWithOptions(t.TempDir(), llm, Options{
-		WikiBackend: "magic",
+		WikiBackend:    "magic",
+		CompileBackend: "llm",
+		QueryBackend:   "llm",
 	})
 	if err == nil {
 		t.Fatal("expected error for unknown WIKI_BACKEND")
@@ -889,7 +904,9 @@ func TestNewWithOptionsRejectsUnknownWikiBackend(t *testing.T) {
 func TestNewWithOptionsRejectsUnknownQueryBackend(t *testing.T) {
 	llm := &mockLLM{response: "ok"}
 	_, err := NewWithOptions(t.TempDir(), llm, Options{
-		QueryBackend: "magic",
+		WikiBackend:    "llm",
+		CompileBackend: "llm",
+		QueryBackend:   "magic",
 	})
 	if err == nil {
 		t.Fatal("expected error for unknown QUERY_BACKEND")
@@ -917,6 +934,9 @@ func TestNewWithOptionsRejectsACPWithoutConfig(t *testing.T) {
 func TestWikiMuSerializesCompileRecallInACPMode(t *testing.T) {
 	llm := &activeCountingLLM{delay: 20 * time.Millisecond}
 	h, err := NewWithOptions(t.TempDir(), llm, Options{
+		WikiBackend:               "llm",
+		CompileBackend:            "llm",
+		QueryBackend:              "llm",
 		IngestTimeout:             2 * time.Second,
 		MaxConcurrentIntegrations: 4,
 	})
