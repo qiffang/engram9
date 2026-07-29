@@ -49,6 +49,14 @@ const compileReceiptName = "compile-receipt.jsonl"
 //     multi_read; either way the cursor does not advance and staging is
 //     discarded (store unchanged).
 func (b *ACPBackend) RunCompile(ctx context.Context, cursor uint64) (CompileResult, error) {
+	return b.runCompile(ctx, cursor, buildCompilePrompt(cursor))
+}
+
+// runCompile is the shared compile implementation. RunCompile drives it with the
+// production compile prompt; tests inject alternate prompts (e.g. a deliberate
+// double-read to exercise the multi_read invalid-receipt discard path) while
+// keeping the exact same receipt-gate / staging-discard machinery.
+func (b *ACPBackend) runCompile(ctx context.Context, cursor uint64, prompt string) (CompileResult, error) {
 	// Capture the pre-turn event count (snapshot bound) from the live store.
 	store, err := storage.NewFS(b.dataDir)
 	if err != nil {
@@ -64,8 +72,6 @@ func (b *ACPBackend) RunCompile(ctx context.Context, cursor uint64) (CompileResu
 	if err != nil {
 		return CompileResult{}, fmt.Errorf("generate turn id: %w", err)
 	}
-
-	prompt := buildCompilePrompt(cursor)
 
 	// validatedCursor is filled by the preMerge hook if the receipt is valid.
 	var validatedCursor uint64
@@ -93,7 +99,14 @@ func (b *ACPBackend) RunCompile(ctx context.Context, cursor uint64) (CompileResu
 		},
 	}
 
-	result, err := b.runACPTurnFullOpts(ctx, prompt, ValidateOptions{AllowDelete: false}, opts)
+	// Compile runs sleep-pruning: archive_wiki_page MOVES a stale page out of the
+	// active tree into archive/. That is a paired move, not a destruction — the
+	// active page disappears IFF a byte-identical copy appears under archive/.
+	// We grant AllowPairedArchiveMove (NOT blanket AllowDelete): an unpaired
+	// delete (active page gone with no archive copy) is still rejected, so a
+	// hallucinating agent cannot destroy knowledge. "needs archiving" ≠ "allowed
+	// to destroy" (architect/adversary-2 paired-move contract).
+	result, err := b.runACPTurnFullOpts(ctx, prompt, ValidateOptions{AllowPairedArchiveMove: true}, opts)
 	if err != nil {
 		return CompileResult{Summary: result.Summary}, err
 	}

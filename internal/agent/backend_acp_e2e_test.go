@@ -150,12 +150,16 @@ func newE2EBackend(t *testing.T, dataDir, acpmux string) *ACPBackend {
 }
 
 // TestE2ECompileClaude runs a real compile cycle through acpmux+Claude and
-// asserts the receipt protocol, snapshot-bound (A1), and cursor advancement.
+// asserts the receipt protocol and cursor advancement over a seeded store.
 //
-// Setup: seed 2 events, capture the pre-turn event bound, then append a THIRD
-// event AFTER the bound is captured to prove snapshot-bound — the post-start
-// event must be structurally invisible to this turn (cursor must NOT advance
-// past 2, receipt new_cursor must be clamped to the bound).
+// Scope note (no overclaim): this test verifies that a real Claude compile turn
+// reads events via the receipt-emitting tool and advances the cursor to the
+// pre-turn bound, distilling events into the wiki. It does NOT discriminate the
+// snapshot-bound CLAMP — that clamp executes entirely inside engram9-mcp (Claude
+// does not participate in it), so wrapping Claude around it adds no discriminating
+// power. The discriminating snapshot-bound (A1) evidence is
+// TestCompileReadEventsSnapshotBoundClamp in cmd/engram9-mcp (real binary,
+// 5 events, -event-bound 3 → clamped to 3; a non-clamping impl fails there).
 func TestE2ECompileClaude(t *testing.T) {
 	acpmux := requireE2ETooling(t)
 	buildEngram9MCPOnPath(t)
@@ -165,13 +169,6 @@ func TestE2ECompileClaude(t *testing.T) {
 		seedEvent("evt_002", "drive9 stores objects in a content-addressed store keyed by SHA-256."),
 	)
 
-	// The RunCompile snapshot-bound is captured INSIDE RunCompile at spawn time.
-	// To exercise A1 deterministically we append a post-bound event via a second
-	// store handle right before the turn; because RunCompile re-reads the bound
-	// from disk at entry, appending here still lands inside [seed, bound). To
-	// truly test A1 we instead rely on the bound == 2 (seeded) and assert the
-	// cursor never exceeds the seeded count. (A dedicated post-spawn injection is
-	// covered by the unit test TestRunCompile_SnapshotBound with a fake store.)
 	store, err := storage.NewFS(dataDir)
 	require.NoError(t, err)
 	page, err := store.ReadEventsSince(0)
@@ -193,61 +190,6 @@ func TestE2ECompileClaude(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, hits, "compile must distill events into wiki pages (found no 'drive9' mention)")
 	t.Logf("compile E2E: cursor 0 -> %d, %d wiki lines mention drive9", res.NewCursor, len(hits))
-}
-
-// TestE2ECompileFailureAtomic proves that a compile turn which produces NO
-// valid receipt leaves the store entirely unchanged (A2 / invariant 11).
-//
-// We force "no valid receipt" by pointing the turn at a store and using a
-// prompt-independent guarantee: the receipt path lives inside the staging dir
-// and is validated against a per-turn nonce, so if we corrupt the flow the
-// cursor must not advance. Here we assert the weaker-but-real property that a
-// SUCCESSFUL turn advanced the cursor AND a re-run from the already-advanced
-// cursor (no new events) does not advance further and does not mutate the wiki
-// snapshot beyond an idempotent no-op.
-func TestE2ECompileFailureAtomic(t *testing.T) {
-	acpmux := requireE2ETooling(t)
-	buildEngram9MCPOnPath(t)
-
-	dataDir := newSeededDataDir(t,
-		seedEvent("evt_001", "The canon9 wiki flow compiles raw events into a structured wiki."),
-	)
-	b := newE2EBackend(t, dataDir, acpmux)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*e2eTurnTimeout+time.Minute)
-	defer cancel()
-
-	// First compile consumes the single event.
-	res1, err := b.RunCompile(ctx, 0)
-	require.NoError(t, err, "first compile: %s", res1.Summary)
-	require.Equal(t, uint64(1), res1.NewCursor)
-
-	rawPath := filepath.Join(dataDir, "raw", "events.jsonl")
-	beforeRaw := hashFile(t, rawPath)
-
-	// Re-run from the advanced cursor: there are no new events in [1, bound),
-	// so read_events_since returns an empty page with new_cursor == 1. The
-	// receipt is still valid (cursor_in == expected == 1), so the cursor stays
-	// at 1 and no raw events are appended. This exercises the empty-window path
-	// without spuriously advancing the cursor.
-	res2, err := b.RunCompile(ctx, 1)
-	require.NoError(t, err, "second compile (empty window): %s", res2.Summary)
-	require.Equal(t, uint64(1), res2.NewCursor, "cursor must not advance past bound on empty window")
-
-	// The raw log must be byte-identical (no new events, no cursor regression).
-	// The wiki may be rewritten idempotently by the agent, so we assert the
-	// raw-log invariant strictly — that is the store-of-record for events.
-	afterRaw := hashFile(t, rawPath)
-	require.Equal(t, beforeRaw, afterRaw, "empty-window compile must not append raw events")
-	t.Logf("failure-atomic E2E: empty-window re-run kept cursor at %d, raw log unchanged", res2.NewCursor)
-}
-
-// hashFile returns the sha256 of a single file.
-func hashFile(t *testing.T, path string) string {
-	t.Helper()
-	data, err := os.ReadFile(path)
-	require.NoError(t, err)
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
 }
 
 // TestE2EQueryClaude runs a real read-only query through acpmux+Claude and
