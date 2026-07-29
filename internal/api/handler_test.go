@@ -869,6 +869,54 @@ func TestRememberMethodNotAllowed(t *testing.T) {
 	}
 }
 
+// I5 zero-apikey completeness: with every capability on acp, the handler
+// constructs with a NIL LLM client (no LLM client needed, no apikey read).
+// If any capability secretly required an LLM client, this would panic/deref nil.
+func TestNewWithOptionsAllACPNoLLMClient(t *testing.T) {
+	scriptPath := filepath.Join(t.TempDir(), "acpmux")
+	require.NoError(t, os.WriteFile(scriptPath, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+	// llm is nil — an all-acp deployment must not construct or use an LLM client.
+	h, err := NewWithOptions(t.TempDir(), nil, Options{
+		WikiBackend:    "acp",
+		CompileBackend: "acp",
+		QueryBackend:   "acp",
+		ACPConfig: &agent.ACPBackendConfig{
+			Provider: "claude", AcpmuxCommand: scriptPath, TurnTimeout: time.Second,
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t, "acp", h.wikiBackendName)
+	require.Equal(t, "acp", h.compileBackendName)
+	require.Equal(t, "acp", h.queryBackendName)
+
+	// /status must report every capability as acp.
+	statusResp := httptest.NewRecorder()
+	h.Routes().ServeHTTP(statusResp, httptest.NewRequest(http.MethodGet, "/status", nil))
+	require.Equal(t, http.StatusOK, statusResp.Code)
+	var status StatusResponse
+	require.NoError(t, json.NewDecoder(statusResp.Body).Decode(&status))
+	require.Equal(t, "acp", status.IngestBackend)
+	require.Equal(t, "acp", status.CompileBackend)
+	require.Equal(t, "acp", status.QueryBackend)
+	require.Equal(t, "claude", status.ACPProvider)
+}
+
+// Defaults: an empty Options must default every capability to acp (the wiki
+// flow runs through an agent by default, never the apikey LLM path).
+func TestNewWithOptionsDefaultsToACP(t *testing.T) {
+	scriptPath := filepath.Join(t.TempDir(), "acpmux")
+	require.NoError(t, os.WriteFile(scriptPath, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+	h, err := NewWithOptions(t.TempDir(), nil, Options{
+		ACPConfig: &agent.ACPBackendConfig{
+			Provider: "claude", AcpmuxCommand: scriptPath, TurnTimeout: time.Second,
+		},
+	})
+	require.NoError(t, err)
+	require.Equal(t, "acp", h.wikiBackendName)
+	require.Equal(t, "acp", h.compileBackendName)
+	require.Equal(t, "acp", h.queryBackendName)
+}
+
 // QUERY_BACKEND=acp is now supported (canon9-ai #41); without ACP config it
 // must fail fast (no silent LLM fallback), not be rejected as unsupported.
 func TestNewWithOptionsQueryBackendACPRequiresConfig(t *testing.T) {
