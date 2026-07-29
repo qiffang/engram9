@@ -261,6 +261,11 @@ type acpTurnOptions struct {
 	preMerge func(stagingDir string) error
 	// skipMerge leaves the store untouched even on success (query is read-only).
 	skipMerge bool
+	// allowedTools overrides the acpmux --allowedTools whitelist. Empty ⇒ the
+	// agent (ingest) surface. Compile and query pass their mode's tool set so the
+	// mode-only tools (read_events_since / archive / rebuild for compile) are
+	// actually callable by the agent.
+	allowedTools []string
 }
 
 func (b *ACPBackend) runACPTurnFull(ctx context.Context, prompt string, valOpts ValidateOptions) (TurnResult, error) {
@@ -284,7 +289,7 @@ func (b *ACPBackend) runACPTurnFullOpts(ctx context.Context, prompt string, valO
 	// Claude needs ToolSearch to discover MCP tools at runtime, plus Glob/Grep
 	// for read-only file access. Write isolation is enforced by --allowedTools
 	// restricting to engram9 MCP tools only (no Write/Edit/Bash).
-	cmd := exec.CommandContext(ctx, b.cfg.AcpmuxCommand, acpmuxArgs(b.cfg.Provider)...)
+	cmd := exec.CommandContext(ctx, b.cfg.AcpmuxCommand, acpmuxArgs(b.cfg.Provider, opts.allowedTools)...)
 	cmd.Stderr = os.Stderr
 
 	stdin, err := cmd.StdinPipe()
@@ -381,7 +386,15 @@ func (b *ACPBackend) runACPTurnFullOpts(ctx context.Context, prompt string, valO
 	}
 
 	// 6. Stream events until completion.
-	var summary string
+	//
+	// The Claude ACP adapter streams the agent's textual answer as a series of
+	// session/update notifications with sessionUpdate="agent_message_chunk"; the
+	// final session/prompt response (id=3) does NOT carry the answer text. So we
+	// accumulate the chunk text and use it as the turn summary when the final
+	// response text is empty (which it is for the Claude adapter). This matters
+	// for query, whose entire output IS the answer text.
+	var responseText string
+	var chunks strings.Builder
 	promptCompleted := false
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -396,7 +409,7 @@ func (b *ACPBackend) runACPTurnFullOpts(ctx context.Context, prompt string, valO
 
 		// Check for errors.
 		if resp.Error != nil {
-			return TurnResult{Summary: summary}, fmt.Errorf("ACP error %d: %s", resp.Error.Code, resp.Error.Message)
+			return TurnResult{Summary: chunks.String()}, fmt.Errorf("ACP error %d: %s", resp.Error.Code, resp.Error.Message)
 		}
 
 		// If this is a response to our prompt request (id=3), we're done.
@@ -407,15 +420,25 @@ func (b *ACPBackend) runACPTurnFullOpts(ctx context.Context, prompt string, valO
 					Text string `json:"text"`
 				}
 				_ = json.Unmarshal(resp.Result, &promptResult)
-				summary = promptResult.Text
+				responseText = promptResult.Text
 			}
 			break
 		}
 
-		// Otherwise it's a notification/update — log and continue.
+		// Otherwise it's a notification/update — accumulate agent message text.
 		if resp.Method != "" {
+			if text := agentMessageChunkText(resp.Params); text != "" {
+				chunks.WriteString(text)
+			}
+			if os.Getenv("ENGRAM9_ACP_DEBUG") != "" {
+				log.Printf("[acp-debug] %s params=%s", resp.Method, string(resp.Params))
+			}
 			log.Printf("[acp] notification: %s", resp.Method)
 		}
+	}
+	summary := responseText
+	if summary == "" {
+		summary = chunks.String()
 	}
 	if err := scanner.Err(); err != nil {
 		return TurnResult{Summary: summary}, fmt.Errorf("read acp output: %w", err)
@@ -476,13 +499,83 @@ type acpError struct {
 	Message string `json:"message"`
 }
 
-func acpmuxArgs(provider string) []string {
+// agentMessageChunkText extracts the text of a session/update notification that
+// carries an agent_message_chunk. Other update kinds (status, tool_call,
+// tool_call_update, plan, usage) return "". The Claude adapter streams the
+// answer as these chunks; the final prompt response text is empty, so this is
+// the only source of the agent's textual output. Verified against real acpmux
+// payloads:
+//
+//	{"sessionId":...,"update":{"sessionUpdate":"agent_message_chunk",
+//	 "content":{"type":"text","text":"..."}}}
+func agentMessageChunkText(params json.RawMessage) string {
+	if len(params) == 0 {
+		return ""
+	}
+	var p struct {
+		Update struct {
+			SessionUpdate string `json:"sessionUpdate"`
+			Content       struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"update"`
+	}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return ""
+	}
+	if p.Update.SessionUpdate != "agent_message_chunk" {
+		return ""
+	}
+	if p.Update.Content.Type != "text" {
+		return ""
+	}
+	return p.Update.Content.Text
+}
+
+// engram9 MCP tool names, prefixed as the Claude adapter exposes injected MCP
+// tools (mcp__<server>__<tool>). The --allowedTools whitelist below is the
+// runtime capability boundary: a tool the mode needs but omits here is simply
+// not callable by the agent, so its whole flow silently no-ops (e.g. compile
+// without read_events_since produces no receipt). The whitelist MUST match the
+// mode's mcp tool surface (mcp.CompileMCPTools / QueryMCPTools / AgentMCPTools).
+const (
+	mcpToolReadWikiIndex   = "mcp__engram9__read_wiki_index"
+	mcpToolReadWikiPage    = "mcp__engram9__read_wiki_page"
+	mcpToolWriteWikiPage   = "mcp__engram9__write_wiki_page"
+	mcpToolSearchWiki      = "mcp__engram9__search_wiki"
+	mcpToolReadEventsSince = "mcp__engram9__read_events_since"
+	mcpToolArchiveWikiPage = "mcp__engram9__archive_wiki_page"
+	mcpToolRebuildIndex    = "mcp__engram9__rebuild_index"
+)
+
+// agentAllowedTools is the default (ingest/batch) capability surface.
+var agentAllowedTools = []string{
+	mcpToolReadWikiIndex, mcpToolReadWikiPage, mcpToolWriteWikiPage, mcpToolSearchWiki,
+}
+
+// compileAllowedTools adds the compile-only tools (read_events_since,
+// archive_wiki_page, rebuild_index) to the agent wiki tools.
+var compileAllowedTools = []string{
+	mcpToolReadWikiIndex, mcpToolReadWikiPage, mcpToolWriteWikiPage, mcpToolSearchWiki,
+	mcpToolReadEventsSince, mcpToolArchiveWikiPage, mcpToolRebuildIndex,
+}
+
+// queryAllowedTools is the strictly read-only query surface: NO write tool.
+var queryAllowedTools = []string{
+	mcpToolReadWikiIndex, mcpToolReadWikiPage, mcpToolSearchWiki,
+}
+
+func acpmuxArgs(provider string, allowedTools []string) []string {
+	if len(allowedTools) == 0 {
+		allowedTools = agentAllowedTools
+	}
 	return []string{
 		"--provider", provider,
 		"--provider-arg", "--tools",
 		"--provider-arg", "ToolSearch,Glob,Grep",
 		"--provider-arg", "--allowedTools",
-		"--provider-arg", "mcp__engram9__read_wiki_index,mcp__engram9__read_wiki_page,mcp__engram9__write_wiki_page,mcp__engram9__search_wiki",
+		"--provider-arg", strings.Join(allowedTools, ","),
 		"--provider-arg", "--permission-mode",
 		"--provider-arg", "dontAsk",
 		"--provider-arg", "--strict-mcp-config",

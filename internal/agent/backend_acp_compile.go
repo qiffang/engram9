@@ -72,6 +72,7 @@ func (b *ACPBackend) RunCompile(ctx context.Context, cursor uint64) (CompileResu
 	receiptValidated := false
 
 	opts := acpTurnOptions{
+		allowedTools: compileAllowedTools,
 		mcpArgs: func(stagingDir string) []string {
 			return []string{
 				"-data", stagingDir,

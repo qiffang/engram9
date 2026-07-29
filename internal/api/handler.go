@@ -89,11 +89,11 @@ type Options struct {
 	LLMModel                     string
 	LLMBaseURL                   string
 
-	// WikiBackend selects the backend for ingest: "llm" (default) or "acp".
+	// WikiBackend selects the backend for ingest: "acp" (default) or "llm".
 	WikiBackend string
-	// CompileBackend selects the backend for compile: "llm" (default) or "acp".
+	// CompileBackend selects the backend for compile: "acp" (default) or "llm".
 	CompileBackend string
-	// QueryBackend selects the backend for query: "llm" (default) or "acp".
+	// QueryBackend selects the backend for query: "acp" (default) or "llm".
 	QueryBackend string
 	// ACPConfig is required when any of WikiBackend/CompileBackend/QueryBackend == "acp".
 	ACPConfig *agent.ACPBackendConfig

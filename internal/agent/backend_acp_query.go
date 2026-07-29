@@ -21,6 +21,7 @@ func (b *ACPBackend) RunQuery(ctx context.Context, question string, ctxInfo map[
 	prompt := buildQueryPrompt(question, ctxInfo, recentEvents)
 
 	opts := acpTurnOptions{
+		allowedTools: queryAllowedTools,
 		mcpArgs: func(stagingDir string) []string {
 			return []string{"-data", stagingDir, "-mode", "query"}
 		},
