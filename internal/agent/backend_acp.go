@@ -93,7 +93,7 @@ func NewACPBackend(dataDir string, cfg ACPBackendConfig) (*ACPBackend, error) {
 	// Phase 1: only Claude adapter supports MCP server injection via acpmux.
 	// Codex adapter ignores MCPServers today.
 	if cfg.Provider != "claude" {
-		return nil, fmt.Errorf("ACP_PROVIDER=%q is not supported in Phase 1 (only 'claude' has MCP injection)", cfg.Provider)
+		return nil, fmt.Errorf("ACP_PROVIDER=%q is not supported in Phase 1 (only 'claude' has MCP injection); see canon9-ai#41 §2 provider matrix — codex is pending isolation + e2e gate", cfg.Provider)
 	}
 	if cfg.AcpmuxCommand == "" {
 		cfg.AcpmuxCommand = "acpmux"
