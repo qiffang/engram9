@@ -185,13 +185,24 @@ func (v *WikiValidator) Validate(prodDir, stagingDir string, opts ...ValidateOpt
 				}
 
 				relPath, _ := filepath.Rel(prodWiki, path)
-				// Archived prod pages are not "active" pages; their disappearance
-				// from the active tree is handled by the active-page check, so skip
-				// prod archive/ entries here.
+				stagingPath := filepath.Join(stagingWiki, relPath)
+
+				// Existing archive/** history is APPEND-ONLY under the paired-move
+				// contract: mergeWiki replaces the whole wiki/ subtree, so a staging
+				// tree that omits an existing archived page would DELETE archive
+				// history on merge. Reject any prod archive/** entry missing from
+				// staging (deletion), regardless of AllowPairedArchiveMove. New
+				// archive entries (a fresh move) are allowed by the staging walk;
+				// modifying an existing one is rejected there (byte-identity).
 				if isArchivePath(relPath) {
+					if _, statErr := os.Stat(stagingPath); os.IsNotExist(statErr) {
+						violations = append(violations, Violation{
+							Path:    relPath,
+							Message: "archived page deleted in staging (archive/ history is append-only)",
+						})
+					}
 					return nil
 				}
-				stagingPath := filepath.Join(stagingWiki, relPath)
 				if _, statErr := os.Stat(stagingPath); os.IsNotExist(statErr) {
 					if opt.AllowPairedArchiveMove && isFaithfulArchiveMove(prodWiki, stagingWiki, relPath) {
 						return nil // paired move: P moved to archive/P byte-identically

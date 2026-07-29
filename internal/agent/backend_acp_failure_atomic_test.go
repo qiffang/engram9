@@ -2,6 +2,7 @@ package agent
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/qiffang/engram9/internal/storage"
 	"github.com/stretchr/testify/require"
@@ -150,19 +152,27 @@ func runFailureAtomicScenario(t *testing.T, turnID string, cursor, eventBound ui
 	_, statArchived := os.Stat(filepath.Join(stagingDir, "wiki", "archive", "semantic", "projects", "stale.md"))
 	require.NoError(t, statArchived, "staging: stale.md should exist under archive/")
 
-	// --- The REAL merge gate, mirroring runACPTurnFullOpts steps 7–8. ---
-	v := NewWikiValidator(DefaultACPMaxDiffBytes)
-	violations, err := v.Validate(liveDir, stagingDir, ValidateOptions{AllowPairedArchiveMove: true})
-	require.NoError(t, err)
-	require.Empty(t, violations, "staged mutations must be VALID (paired archive move); the discard is driven by the receipt, not by validation")
-
-	_, receiptErr := validateCompileReceipt(receiptPath, turnID, cursor, eventBound)
-	require.Error(t, receiptErr, "receipt must be invalid for this scenario")
-	require.Contains(t, receiptErr.Error(), wantReceiptErr)
-
-	// Invalid receipt ⇒ preMerge returns error ⇒ merge is SKIPPED ⇒ staging
-	// discarded. We assert the discard's effect on the live store: nothing merged.
-	// (mergeWiki is NOT called; the live store is left exactly as before.)
+	// Run the SHARED, ordered commit gate that production uses
+	// (commitStagingTurn: validate → preMerge → merge). The preMerge hook is the
+	// real compile receipt validation. Because the receipt is invalid, preMerge
+	// returns an error BEFORE merge, so mergeWiki must never run — and an ordering
+	// regression (merge before preMerge) would mutate the live store and fail the
+	// whole-tree assertion below.
+	b := &ACPBackend{dataDir: liveDir, validator: NewWikiValidator(DefaultACPMaxDiffBytes)}
+	var receiptValidated bool
+	res, turnErr := b.commitStagingTurn(stagingDir, "", ValidateOptions{AllowPairedArchiveMove: true}, acpTurnOptions{
+		preMerge: func(sd string) error {
+			_, verr := validateCompileReceipt(filepath.Join(sd, compileReceiptName), turnID, cursor, eventBound)
+			if verr == nil {
+				receiptValidated = true
+			}
+			return verr
+		},
+	})
+	require.Error(t, turnErr, "commit gate must fail on an invalid receipt")
+	require.Contains(t, turnErr.Error(), wantReceiptErr)
+	require.False(t, receiptValidated, "receipt must not validate")
+	require.False(t, res.Merged, "no merge may occur on an invalid-receipt turn")
 
 	// Whole-tree assertion: live store byte-for-byte identical.
 	afterHash := hashTree(t, liveDir)
@@ -175,6 +185,58 @@ func runFailureAtomicScenario(t *testing.T, turnID string, cursor, eventBound ui
 	require.NoError(t, liveActive, "live: stale.md must remain active (archive move rolled back)")
 	_, liveArchived := os.Stat(filepath.Join(liveDir, "wiki", "archive", "semantic", "projects", "stale.md"))
 	require.True(t, os.IsNotExist(liveArchived), "live: no archived copy may appear (whole staging discarded)")
+}
+
+// TestRunCompileOrchestrationDiscardsOnInvalidReceipt drives the REAL
+// runCompile → runACPTurnFullOpts → commitStagingTurn path end-to-end through a
+// fake acpmux (AcpmuxCommand seam, same pattern as the ingest scripted-acpmux
+// tests). The fake acpmux completes a turn WITHOUT spawning engram9-mcp, so no
+// receipt is written → no_valid_receipt → the real orchestration must discard
+// staging and NOT merge. This locks the real spawn/staging/validate→preMerge→
+// merge ORDERING (not just the leaf commit function): an implementation that
+// merged before validating the receipt, or ignored the preMerge error, would
+// mutate the live store and fail this test.
+func TestRunCompileOrchestrationDiscardsOnInvalidReceipt(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := storage.NewFS(dataDir)
+	require.NoError(t, err)
+	require.NoError(t, store.WriteWikiPageWithMeta(
+		"semantic/projects/keep.md",
+		"<!-- compiled_from: evt_000 -->\n<!-- last_compiled: 2026-07-01T00:00:00Z -->\n# keep\n\nlive content\n",
+		[]string{"evt_000"}, 1,
+	))
+	require.NoError(t, store.RebuildIndex())
+	beforeHash := hashTree(t, dataDir)
+	cursorBefore := store.GetCompileCursor()
+
+	// Fake acpmux: answer the ACP handshake and complete the prompt, but never
+	// spawn engram9-mcp — so the compile receipt file is never written.
+	scriptPath := filepath.Join(t.TempDir(), "acpmux")
+	script := "#!/bin/sh\nset -eu\n" + `
+read _init
+echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
+read _initnotif
+read _session
+echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"session"}}'
+read _prompt
+echo '{"jsonrpc":"2.0","id":3,"result":{"text":"done (no receipt written)"}}'
+`
+	require.NoError(t, os.WriteFile(scriptPath, []byte(script), 0o755))
+
+	b, err := NewACPBackend(dataDir, ACPBackendConfig{
+		Provider: "claude", AcpmuxCommand: scriptPath, TurnTimeout: 10 * time.Second,
+	})
+	require.NoError(t, err)
+
+	res, err := b.runCompile(context.Background(), 0, "compile please")
+	require.Error(t, err, "invalid (missing) receipt must fail the turn")
+	require.Contains(t, err.Error(), "no_valid_receipt")
+	require.Equal(t, uint64(0), res.NewCursor, "cursor must not advance on an invalid-receipt turn")
+
+	// The live store must be byte-for-byte unchanged (nothing merged).
+	require.Equal(t, beforeHash, hashTree(t, dataDir),
+		"real runCompile orchestration must discard staging on an invalid receipt (no merge)")
+	require.Equal(t, cursorBefore, store.GetCompileCursor(), "cursor unchanged on disk")
 }
 
 // TestCompileFailureAtomic_MultiRead: two read_events_since calls in one turn →

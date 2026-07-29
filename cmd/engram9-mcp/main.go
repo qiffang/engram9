@@ -86,6 +86,15 @@ func main() {
 			fmt.Fprintln(os.Stderr, "error: -mode compile requires -turn-id and -receipt")
 			os.Exit(1)
 		}
+		// -event-bound is REQUIRED in compile mode. It is the snapshot bound that
+		// makes read_events_since serve only pre-turn events; if it were omitted it
+		// would default to 0 and the server would serve events UNBOUNDED (A1 safety
+		// invariant). 0 is a legitimate value ("zero events visible"), so we detect
+		// explicit presence rather than a non-zero value.
+		if !flagWasSet("event-bound") {
+			fmt.Fprintln(os.Stderr, "error: -mode compile requires -event-bound (snapshot bound; pass 0 for zero-events-visible)")
+			os.Exit(1)
+		}
 		server = mcp.NewCompileServer(store, *turnID, *eventBound, *receiptPath)
 	case "query":
 		// Query is strictly read-only; it works over either a runtime store or
@@ -101,4 +110,17 @@ func main() {
 	if err := server.Serve(os.Stdin, os.Stdout); err != nil {
 		log.Fatalf("serve: %v", err)
 	}
+}
+
+// flagWasSet reports whether the named flag was explicitly provided on the
+// command line (as opposed to left at its default). Used to require -event-bound
+// in compile mode where 0 is a legitimate value distinct from "omitted".
+func flagWasSet(name string) bool {
+	set := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
+	})
+	return set
 }

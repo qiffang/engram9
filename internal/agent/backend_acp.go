@@ -447,7 +447,25 @@ func (b *ACPBackend) runACPTurnFullOpts(ctx context.Context, prompt string, valO
 		return TurnResult{Summary: summary}, fmt.Errorf("read acp output: prompt response missing: %w", io.EOF)
 	}
 
-	// 7. Validate staging wiki.
+	// 7–8. Commit gate: validate → preMerge → merge (or discard). Extracted into
+	// commitStagingTurn so the failure-atomic tests exercise the SAME ordered
+	// decision path production uses (an ordering regression — e.g. merge before
+	// preMerge — must fail those tests, not just a hand-orchestrated replica).
+	return b.commitStagingTurn(stagingDir, summary, valOpts, opts)
+}
+
+// commitStagingTurn runs the ordered commit gate against a prepared staging dir:
+//  1. validate staging against production (taxonomy/frontmatter/diff/paired-move);
+//     any violation → return without merge (staging discarded by the caller).
+//  2. preMerge hook (compile receipt validation) → error → return without merge
+//     (staging discarded). This MUST run BEFORE merge so an invalid receipt
+//     leaves the live store — wiki, archive, index, .meta, cursor — exactly as
+//     before (invariant 11 / A2 failure-atomicity).
+//  3. merge staging → production (skipped for read-only query turns).
+//
+// The ordering (validate → preMerge → merge) is the load-bearing property: it is
+// shared by production turns and the failure-atomic tests via this one function.
+func (b *ACPBackend) commitStagingTurn(stagingDir, summary string, valOpts ValidateOptions, opts acpTurnOptions) (TurnResult, error) {
 	violations, err := b.validator.Validate(b.dataDir, stagingDir, valOpts)
 	if err != nil {
 		return TurnResult{Summary: summary}, fmt.Errorf("validate staging: %w", err)
@@ -456,16 +474,12 @@ func (b *ACPBackend) runACPTurnFullOpts(ctx context.Context, prompt string, valO
 		return TurnResult{Summary: summary, Violations: violations}, nil
 	}
 
-	// 7b. preMerge gate (compile receipt validation): an error here aborts the
-	// turn with staging discarded (deferred RemoveAll), so the store — wiki,
-	// archive, index, .meta, cursor — is left exactly as before (invariant 11).
 	if opts.preMerge != nil {
 		if err := opts.preMerge(stagingDir); err != nil {
 			return TurnResult{Summary: summary}, err
 		}
 	}
 
-	// 8. Merge staging wiki -> production (skipped for read-only query turns).
 	if opts.skipMerge {
 		return TurnResult{Summary: summary, Merged: false}, nil
 	}

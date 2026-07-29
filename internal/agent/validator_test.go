@@ -333,6 +333,37 @@ func TestWikiValidatorRejectsModifiedExistingArchive(t *testing.T) {
 	}
 }
 
+// TestWikiValidatorRejectsDeletedExistingArchive (regression: archive/** delete)
+// closes the gap adversary-1 caught at 6176f35: mergeWiki replaces the whole
+// wiki/ subtree, so a staging tree that OMITS an existing archived page would
+// silently delete archive history on merge. archive/** is append-only under the
+// paired-move contract — a missing existing archived page must be rejected.
+func TestWikiValidatorRejectsDeletedExistingArchive(t *testing.T) {
+	prod := t.TempDir()
+	staging := t.TempDir()
+
+	// An existing archived page in production.
+	writeTestFile(t, prod, "wiki/archive/semantic/old.md", "# old\n\narchived history\n")
+	writeTestFile(t, prod, "wiki/semantic/a.md", validFrontmatter)
+	// Staging keeps a.md but DROPS the archived page (deletes archive history).
+	writeTestFile(t, staging, "wiki/semantic/a.md", validFrontmatter)
+
+	v := NewWikiValidator(DefaultACPMaxDiffBytes)
+	violations, err := v.Validate(prod, staging, ValidateOptions{AllowPairedArchiveMove: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, vi := range violations {
+		if vi.Path == "archive/semantic/old.md" && contains(vi.Message, "append-only") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("deleting an existing archived page must be rejected (append-only), got: %v", violations)
+	}
+}
+
 func TestWikiValidatorAllowsMetaSidecars(t *testing.T) {
 	prod := t.TempDir()
 	staging := t.TempDir()

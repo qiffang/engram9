@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/qiffang/engram9/internal/storage"
 )
@@ -89,6 +91,14 @@ func (s *Server) execCompileArchiveWikiPage(args map[string]any) (string, error)
 	}
 	if err := validatePath(path); err != nil {
 		return "", err
+	}
+	// Reject archiving something already under archive/: archive/ is append-only
+	// (a page is archived exactly once, from its active path). Allowing an
+	// archive/ input would let an agent restructure archive history (e.g. create
+	// archive/archive/P), which the paired-move validator's one-level trim could
+	// otherwise mistake for a faithful move.
+	if strings.HasPrefix(filepath.ToSlash(path), "archive/") {
+		return "", fmt.Errorf("cannot archive a page already under archive/ (archive is append-only)")
 	}
 	reason, _ := args["reason"].(string)
 	if err := s.store.ArchiveWikiPage(path, reason); err != nil {

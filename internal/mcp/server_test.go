@@ -964,3 +964,28 @@ func TestMultipleRequests(t *testing.T) {
 		t.Fatalf("expected 2 responses, got %d: %q", len(lines), out.String())
 	}
 }
+
+// TestCompileArchiveRejectsArchivePath guards that archive_wiki_page refuses a
+// path already under archive/. archive/ is append-only (a page is archived
+// exactly once from its active path); allowing archive/ input would let an agent
+// restructure archive history (e.g. archive/archive/P), which the paired-move
+// validator's one-level trim could mistake for a faithful move.
+func TestCompileArchiveRejectsArchivePath(t *testing.T) {
+	dir := t.TempDir()
+	store, err := storage.NewFS(dir)
+	if err != nil {
+		t.Fatalf("NewFS: %v", err)
+	}
+	s := NewCompileServer(store, "turnX", 0, filepath.Join(dir, "receipt.jsonl"))
+
+	_, err = s.executeCompileTool("archive_wiki_page", map[string]any{
+		"path":   "archive/semantic/old.md",
+		"reason": "tamper",
+	})
+	if err == nil {
+		t.Fatal("expected error archiving an archive/ path")
+	}
+	if !strings.Contains(err.Error(), "append-only") {
+		t.Fatalf("error = %q, want append-only", err.Error())
+	}
+}
