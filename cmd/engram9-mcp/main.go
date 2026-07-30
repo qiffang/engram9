@@ -28,7 +28,10 @@ import (
 func main() {
 	dataDir := flag.String("data", "", "runtime data directory (same as engram9 HTTP server)")
 	bundleDir := flag.String("bundle", "", "OKF bundle directory to consume (read-only)")
-	mode := flag.String("mode", "consumption", "tool mode: consumption (default 5 tools) or agent (4 IntegrateTools)")
+	mode := flag.String("mode", "consumption", "tool mode: consumption | agent | compile | query")
+	turnID := flag.String("turn-id", "", "compile mode: per-turn freshness nonce stamped into each receipt entry")
+	eventBound := flag.Uint64("event-bound", 0, "compile mode: pre-turn event count; read_events_since serves only events below this bound")
+	receiptPath := flag.String("receipt", "", "compile mode: path where read_events_since appends receipt entries")
 	flag.Parse()
 
 	// Direct all log output to stderr so stdout is clean JSON-RPC.
@@ -64,24 +67,60 @@ func main() {
 		log.Printf("engram9-mcp started in runtime mode (data: %s)", *dataDir)
 	}
 
-	var serverMode mcp.ServerMode
+	var server *mcp.Server
 	switch *mode {
 	case "consumption", "":
-		serverMode = mcp.ModeConsumption
+		server = mcp.NewServerWithMode(store, mcp.ModeConsumption)
 	case "agent":
 		if *bundleDir != "" {
 			fmt.Fprintln(os.Stderr, "error: -mode agent requires -data (read-write store); -bundle is read-only")
 			os.Exit(1)
 		}
-		serverMode = mcp.ModeAgent
+		server = mcp.NewServerWithMode(store, mcp.ModeAgent)
+	case "compile":
+		if *bundleDir != "" {
+			fmt.Fprintln(os.Stderr, "error: -mode compile requires -data (read-write store); -bundle is read-only")
+			os.Exit(1)
+		}
+		if *turnID == "" || *receiptPath == "" {
+			fmt.Fprintln(os.Stderr, "error: -mode compile requires -turn-id and -receipt")
+			os.Exit(1)
+		}
+		// -event-bound is REQUIRED in compile mode. It is the snapshot bound that
+		// makes read_events_since serve only pre-turn events; if it were omitted it
+		// would default to 0 and the server would serve events UNBOUNDED (A1 safety
+		// invariant). 0 is a legitimate value ("zero events visible"), so we detect
+		// explicit presence rather than a non-zero value.
+		if !flagWasSet("event-bound") {
+			fmt.Fprintln(os.Stderr, "error: -mode compile requires -event-bound (snapshot bound; pass 0 for zero-events-visible)")
+			os.Exit(1)
+		}
+		server = mcp.NewCompileServer(store, *turnID, *eventBound, *receiptPath)
+	case "query":
+		// Query is strictly read-only; it works over either a runtime store or
+		// a bundle. The query tool surface registers no write tool and uses the
+		// mutation-free read path (invariant 12).
+		server = mcp.NewServerWithMode(store, mcp.ModeQuery)
 	default:
-		fmt.Fprintf(os.Stderr, "error: unknown mode %q (use 'consumption' or 'agent')\n", *mode)
+		fmt.Fprintf(os.Stderr, "error: unknown mode %q (use 'consumption', 'agent', 'compile', or 'query')\n", *mode)
 		os.Exit(1)
 	}
 
-	server := mcp.NewServerWithMode(store, serverMode)
-	log.Printf("engram9-mcp mode: %s", serverMode)
+	log.Printf("engram9-mcp mode: %s", *mode)
 	if err := server.Serve(os.Stdin, os.Stdout); err != nil {
 		log.Fatalf("serve: %v", err)
 	}
+}
+
+// flagWasSet reports whether the named flag was explicitly provided on the
+// command line (as opposed to left at its default). Used to require -event-bound
+// in compile mode where 0 is a legitimate value distinct from "omitted".
+func flagWasSet(name string) bool {
+	set := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
+	})
+	return set
 }

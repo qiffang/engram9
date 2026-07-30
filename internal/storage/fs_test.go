@@ -413,3 +413,50 @@ func TestConcurrentPageWrites(t *testing.T) {
 		t.Error("expected non-empty content after concurrent writes")
 	}
 }
+
+// TestReadWikiPageReadOnly_NoMetaMutation is the deterministic guard for
+// invariant 12 (query zero store mutation): ReadWikiPageReadOnly must not write
+// access telemetry back to the .meta sidecar. The contrast group — ordinary
+// ReadWikiPage — DOES update the sidecar, which both proves the test is
+// discriminating (it would catch a ReadWikiPageReadOnly that leaked a writeback)
+// and documents the intended difference between the two read paths.
+func TestReadWikiPageReadOnly_NoMetaMutation(t *testing.T) {
+	fs := newTestFS(t)
+	const page = "semantic/projects/db9.md"
+	if err := fs.WriteWikiPageWithMeta(page, "# DB9\n\nPartition tables.\n", []string{"evt_1"}, 1); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	sidecar := fs.sidecarPath(page)
+	before, err := os.ReadFile(sidecar)
+	if err != nil {
+		t.Fatalf("read sidecar: %v", err)
+	}
+
+	// Read-only path: two reads must leave the sidecar byte-for-byte unchanged.
+	for i := 0; i < 2; i++ {
+		if _, err := fs.ReadWikiPageReadOnly(page); err != nil {
+			t.Fatalf("ReadWikiPageReadOnly: %v", err)
+		}
+	}
+	afterReadOnly, err := os.ReadFile(sidecar)
+	if err != nil {
+		t.Fatalf("read sidecar: %v", err)
+	}
+	if string(before) != string(afterReadOnly) {
+		t.Fatalf("ReadWikiPageReadOnly mutated the .meta sidecar (invariant 12 violation):\nbefore=%s\nafter=%s", before, afterReadOnly)
+	}
+
+	// Contrast group: ordinary ReadWikiPage DOES write access telemetry, so the
+	// sidecar must change — proving the read-only assertion above is discriminating.
+	if _, err := fs.ReadWikiPage(page); err != nil {
+		t.Fatalf("ReadWikiPage: %v", err)
+	}
+	afterMutating, err := os.ReadFile(sidecar)
+	if err != nil {
+		t.Fatalf("read sidecar: %v", err)
+	}
+	if string(afterMutating) == string(afterReadOnly) {
+		t.Fatal("ReadWikiPage should update the .meta sidecar (contrast group); if it does not, the read-only test is not discriminating")
+	}
+}

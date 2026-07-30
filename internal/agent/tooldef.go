@@ -124,8 +124,11 @@ var ToolGetMemoryStats = Tool{
 
 // Tool sets for each agent role.
 var (
-	IngestTools  = []Tool{ToolAppendEvent, ToolReadWikiIndex, ToolReadWikiPage, ToolWriteWikiPage, ToolSearchWiki}
-	QueryTools   = []Tool{ToolReadWikiIndex, ToolReadWikiPage, ToolSearchWiki, ToolWriteWikiPage}
+	IngestTools = []Tool{ToolAppendEvent, ToolReadWikiIndex, ToolReadWikiPage, ToolWriteWikiPage, ToolSearchWiki}
+	// QueryTools is strictly read-only (invariant 1/12): the query agent must
+	// not be able to mutate the wiki on any backend. WriteWikiPage was present
+	// here historically (inventory ⚠ in #41) and is removed.
+	QueryTools   = []Tool{ToolReadWikiIndex, ToolReadWikiPage, ToolSearchWiki}
 	CompileTools = []Tool{ToolReadEventsSince, ToolReadWikiIndex, ToolReadWikiPage, ToolWriteWikiPage, ToolArchiveWikiPage, ToolRebuildIndex, ToolSearchWiki}
 )
 

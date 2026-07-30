@@ -29,12 +29,33 @@ const (
 	ModeConsumption ServerMode = "consumption"
 	// ModeAgent exposes the 4 IntegrateTools (read_wiki_index, read_wiki_page, write_wiki_page, search_wiki).
 	ModeAgent ServerMode = "agent"
+	// ModeCompile exposes CompileTools: the agent-mode wiki tools plus
+	// read_events_since, archive_wiki_page, and rebuild_index. The tool surface
+	// IS the capability boundary (invariant 1). Mutating tools operate on the
+	// staged workspace; archive/rebuild record intents rather than mutating the
+	// live wiki (Unit 1, adversary-1 A2).
+	ModeCompile ServerMode = "compile"
+	// ModeQuery exposes a strictly read-only surface (read_wiki_index,
+	// read_wiki_page, search_wiki) with NO write tool registered. The store
+	// handle is opened read-only: no content writes, no .meta access-telemetry
+	// updates, no index writes (invariant 12, adversary-1 A3).
+	ModeQuery ServerMode = "query"
 )
 
 // Server handles MCP JSON-RPC requests over stdio.
 type Server struct {
 	store storage.Store
 	mode  ServerMode
+
+	// compile-mode context (set only in ModeCompile). turnID stamps every
+	// receipt entry so the handler can reject stale receipts from prior turns
+	// (invariant 2 / D1). eventBound is the pre-turn event count: read_events_since
+	// serves only events in [cursor, eventBound) so post-start /remember appends
+	// are structurally invisible to the turn (invariant 10 / A1). receiptPath is
+	// the file where each successful read_events_since appends its entry.
+	turnID      string
+	eventBound  uint64
+	receiptPath string
 }
 
 // NewServer creates an MCP server in consumption mode backed by the given store.
@@ -45,6 +66,19 @@ func NewServer(store storage.Store) *Server {
 // NewServerWithMode creates an MCP server in the specified mode.
 func NewServerWithMode(store storage.Store, mode ServerMode) *Server {
 	return &Server{store: store, mode: mode}
+}
+
+// NewCompileServer creates an MCP server in compile mode with the turn-scoped
+// receipt context: turnID (freshness nonce), eventBound (snapshot upper bound),
+// and receiptPath (where read_events_since appends receipt entries).
+func NewCompileServer(store storage.Store, turnID string, eventBound uint64, receiptPath string) *Server {
+	return &Server{
+		store:       store,
+		mode:        ModeCompile,
+		turnID:      turnID,
+		eventBound:  eventBound,
+		receiptPath: receiptPath,
+	}
 }
 
 // --- JSON-RPC types ---
@@ -234,8 +268,13 @@ func (s *Server) handleInitialize(req jsonRPCRequest) *jsonRPCResponse {
 
 func (s *Server) handleToolsList(req jsonRPCRequest) *jsonRPCResponse {
 	tools := MCPTools
-	if s.mode == ModeAgent {
+	switch s.mode {
+	case ModeAgent:
 		tools = AgentMCPTools
+	case ModeCompile:
+		tools = CompileMCPTools
+	case ModeQuery:
+		tools = QueryMCPTools
 	}
 	return &jsonRPCResponse{
 		JSONRPC: "2.0",

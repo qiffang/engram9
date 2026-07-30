@@ -35,8 +35,16 @@ func NewWikiValidator(maxDiffBytes int64) *WikiValidator {
 
 // ValidateOptions controls validation behavior per turn type.
 type ValidateOptions struct {
-	// AllowDelete permits page deletion in staging (true for compile/prune, false for ingest).
+	// AllowDelete permits UNPAIRED page deletion in staging. This grants
+	// destruction capability and is normally false. Ingest sets it false; the
+	// compile/prune path uses AllowPairedArchiveMove instead.
 	AllowDelete bool
+	// AllowPairedArchiveMove permits sleep-pruning's archive: an active page P
+	// may disappear from the active tree IFF a byte-identical copy exists at
+	// archive/P in staging (a MOVE, not a destroy). An active page removed with
+	// no matching archive copy is still rejected. This is strictly weaker than
+	// AllowDelete: it cannot destroy knowledge, only relocate it to archive/.
+	AllowPairedArchiveMove bool
 }
 
 // Validate compares staging wiki against production wiki and returns violations.
@@ -73,6 +81,34 @@ func (v *WikiValidator) Validate(prodDir, stagingDir string, opts ...ValidateOpt
 		// Skip store-owned sidecar metadata (e.g. .meta/*.json).
 		if strings.HasPrefix(relPath, ".meta/") || strings.HasPrefix(relPath, ".meta\\") {
 			return nil
+		}
+
+		// archive/: sleep-pruning moves a stale active page into archive/ via a
+		// store-managed rename (ArchiveWikiPage). The taxonomy/frontmatter checks
+		// (which target freshly written ACTIVE pages) are exempt for archive/ ONLY
+		// when the archived page is a faithful move: archive/semantic/x.md must be
+		// byte-identical to the former active semantic/x.md in production. That
+		// prevents an agent from smuggling arbitrary content into archive/ to
+		// bypass the taxonomy exemption. A mismatched or source-less archive page
+		// is treated as ordinary content and validated normally (→ taxonomy
+		// violation), so it cannot pass. Its bytes still count toward the diff
+		// budget.
+		if opt.AllowPairedArchiveMove && isArchivePath(relPath) {
+			data, rerr := os.ReadFile(path)
+			if rerr != nil {
+				return rerr
+			}
+			activeRel := strings.TrimPrefix(filepath.ToSlash(relPath), "archive/")
+			prodActive, prodErr := os.ReadFile(filepath.Join(prodWiki, activeRel))
+			if prodErr == nil && string(prodActive) == string(data) {
+				// Faithful move: exempt from taxonomy/frontmatter. Count bytes if new.
+				if _, perr := os.Stat(filepath.Join(prodWiki, relPath)); os.IsNotExist(perr) {
+					totalDiffBytes += int64(len(data))
+				}
+				return nil
+			}
+			// Not a faithful move (no source or content differs): fall through and
+			// validate as ordinary content, which will flag the non-taxonomy path.
 		}
 
 		// Only .md files are allowed in wiki content. Reject anything else.
@@ -131,7 +167,13 @@ func (v *WikiValidator) Validate(prodDir, stagingDir string, opts ...ValidateOpt
 		})
 	}
 
-	// Check that no production pages were deleted in staging (unless allowed for compile/prune).
+	// Check that no production pages were deleted in staging. A page missing from
+	// staging is a violation UNLESS:
+	//   - AllowDelete is set (blanket destruction — not used by compile), or
+	//   - AllowPairedArchiveMove is set AND the missing active page P has a
+	//     byte-identical copy at archive/P in staging (a MOVE, not a destroy).
+	// An unpaired delete (page gone, no matching archive copy) is always rejected,
+	// so compile/prune cannot destroy knowledge — only relocate it.
 	if !opt.AllowDelete {
 		if _, err := os.Stat(prodWiki); err == nil {
 			err := filepath.Walk(prodWiki, func(path string, info os.FileInfo, err error) error {
@@ -144,10 +186,30 @@ func (v *WikiValidator) Validate(prodDir, stagingDir string, opts ...ValidateOpt
 
 				relPath, _ := filepath.Rel(prodWiki, path)
 				stagingPath := filepath.Join(stagingWiki, relPath)
-				if _, err := os.Stat(stagingPath); os.IsNotExist(err) {
+
+				// Existing archive/** history is APPEND-ONLY under the paired-move
+				// contract: mergeWiki replaces the whole wiki/ subtree, so a staging
+				// tree that omits an existing archived page would DELETE archive
+				// history on merge. Reject any prod archive/** entry missing from
+				// staging (deletion), regardless of AllowPairedArchiveMove. New
+				// archive entries (a fresh move) are allowed by the staging walk;
+				// modifying an existing one is rejected there (byte-identity).
+				if isArchivePath(relPath) {
+					if _, statErr := os.Stat(stagingPath); os.IsNotExist(statErr) {
+						violations = append(violations, Violation{
+							Path:    relPath,
+							Message: "archived page deleted in staging (archive/ history is append-only)",
+						})
+					}
+					return nil
+				}
+				if _, statErr := os.Stat(stagingPath); os.IsNotExist(statErr) {
+					if opt.AllowPairedArchiveMove && isFaithfulArchiveMove(prodWiki, stagingWiki, relPath) {
+						return nil // paired move: P moved to archive/P byte-identically
+					}
 					violations = append(violations, Violation{
 						Path:    relPath,
-						Message: "page deleted in staging (ingest should not delete pages)",
+						Message: "page deleted in staging without a byte-identical archive/ copy (compile may archive-move, not destroy)",
 					})
 				}
 				return nil
@@ -174,6 +236,33 @@ func IsValidWikiPath(relPath string) bool {
 		}
 	}
 	return false
+}
+
+// isFaithfulArchiveMove reports whether an active page P (relPath, relative to
+// wiki/) that disappeared from staging's active tree was moved faithfully to
+// archive/P: staging/archive/<relPath> exists and is byte-identical to the
+// former active production page prod/<relPath>. This is the paired-move
+// predicate — it distinguishes a legitimate sleep-pruning archive from an
+// arbitrary deletion or a rewrite disguised as an archive.
+func isFaithfulArchiveMove(prodWiki, stagingWiki, relPath string) bool {
+	prodActive, err := os.ReadFile(filepath.Join(prodWiki, relPath))
+	if err != nil {
+		return false
+	}
+	archived, err := os.ReadFile(filepath.Join(stagingWiki, "archive", relPath))
+	if err != nil {
+		return false
+	}
+	return string(prodActive) == string(archived)
+}
+
+// isArchivePath reports whether relPath (relative to wiki/) is under the
+// store-managed archive/ subtree. Sleep-pruning moves stale active pages here
+// via ArchiveWikiPage; those files are the prior active content, not
+// agent-authored, so taxonomy/frontmatter checks do not apply to them.
+func isArchivePath(relPath string) bool {
+	slash := filepath.ToSlash(relPath)
+	return slash == "archive" || strings.HasPrefix(slash, "archive/")
 }
 
 func isStructuralWikiIndex(relPath string) bool {

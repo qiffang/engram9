@@ -14,8 +14,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/qiffang/engram9/internal/storage"
 )
 
 const (
@@ -95,7 +93,7 @@ func NewACPBackend(dataDir string, cfg ACPBackendConfig) (*ACPBackend, error) {
 	// Phase 1: only Claude adapter supports MCP server injection via acpmux.
 	// Codex adapter ignores MCPServers today.
 	if cfg.Provider != "claude" {
-		return nil, fmt.Errorf("ACP_PROVIDER=%q is not supported in Phase 1 (only 'claude' has MCP injection)", cfg.Provider)
+		return nil, fmt.Errorf("ACP_PROVIDER=%q is not supported in Phase 1 (only 'claude' has MCP injection); see canon9-ai#41 §2 provider matrix — codex is pending isolation + e2e gate", cfg.Provider)
 	}
 	if cfg.AcpmuxCommand == "" {
 		cfg.AcpmuxCommand = "acpmux"
@@ -219,17 +217,8 @@ func (b *ACPBackend) persistTranscript(batchID, summary string) string {
 	return path
 }
 
-func (b *ACPBackend) RunCompile(_ context.Context, _ uint64) (CompileResult, error) {
-	// ACP compile is not yet supported: MCP agent mode only exposes wiki tools
-	// (read_wiki_index, read_wiki_page, write_wiki_page, search_wiki) but compile
-	// requires read_events_since, archive_wiki_page, and rebuild_index.
-	// Until a compile-mode MCP tool set is implemented, compile stays on LLM.
-	return CompileResult{}, ErrNotImplemented
-}
-
-func (b *ACPBackend) RunQuery(_ context.Context, _ string, _ map[string]string, _ []storage.Event) (QueryResult, error) {
-	return QueryResult{}, ErrNotImplemented
-}
+// RunCompile is implemented in backend_acp_compile.go.
+// RunQuery is implemented in backend_acp_query.go.
 
 func (b *ACPBackend) Close() error {
 	return nil
@@ -259,7 +248,31 @@ func (b *ACPBackend) runACPTurn(ctx context.Context, prompt string, valOpts Vali
 	return result.Summary, nil
 }
 
+// acpTurnOptions carries per-turn customization for runACPTurnFull. The
+// default (zero value) reproduces the ingest/batch behavior: agent-mode MCP
+// server, validate, merge.
+type acpTurnOptions struct {
+	// mcpArgs overrides the engram9-mcp launch args. Empty ⇒ agent mode.
+	mcpArgs func(stagingDir string) []string
+	// preMerge runs after validation succeeds and BEFORE merge. Returning an
+	// error aborts the turn with staging discarded (no merge) — compile uses
+	// this to validate the receipt so an invalid receipt leaves the store
+	// entirely unchanged (invariant 11 / A2).
+	preMerge func(stagingDir string) error
+	// skipMerge leaves the store untouched even on success (query is read-only).
+	skipMerge bool
+	// allowedTools overrides the acpmux --allowedTools whitelist. Empty ⇒ the
+	// agent (ingest) surface. Compile and query pass their mode's tool set so the
+	// mode-only tools (read_events_since / archive / rebuild for compile) are
+	// actually callable by the agent.
+	allowedTools []string
+}
+
 func (b *ACPBackend) runACPTurnFull(ctx context.Context, prompt string, valOpts ValidateOptions) (TurnResult, error) {
+	return b.runACPTurnFullOpts(ctx, prompt, valOpts, acpTurnOptions{})
+}
+
+func (b *ACPBackend) runACPTurnFullOpts(ctx context.Context, prompt string, valOpts ValidateOptions, opts acpTurnOptions) (TurnResult, error) {
 
 	// 1. Create staging directory and copy data.
 	stagingDir, err := os.MkdirTemp("", "engram9-acp-staging-*")
@@ -276,7 +289,7 @@ func (b *ACPBackend) runACPTurnFull(ctx context.Context, prompt string, valOpts 
 	// Claude needs ToolSearch to discover MCP tools at runtime, plus Glob/Grep
 	// for read-only file access. Write isolation is enforced by --allowedTools
 	// restricting to engram9 MCP tools only (no Write/Edit/Bash).
-	cmd := exec.CommandContext(ctx, b.cfg.AcpmuxCommand, acpmuxArgs(b.cfg.Provider)...)
+	cmd := exec.CommandContext(ctx, b.cfg.AcpmuxCommand, acpmuxArgs(b.cfg.Provider, opts.allowedTools)...)
 	cmd.Stderr = os.Stderr
 
 	stdin, err := cmd.StdinPipe()
@@ -334,7 +347,11 @@ func (b *ACPBackend) runACPTurnFull(ctx context.Context, prompt string, valOpts 
 	// 4. Send session/new with MCP config.
 	// acpmux expects MCP server fields at top level (type, name, command, args),
 	// NOT nested under a "transport" key.
-	sessionReq := newACPSessionRequest(stagingDir)
+	mcpArgs := []string{"-data", stagingDir, "-mode", "agent"}
+	if opts.mcpArgs != nil {
+		mcpArgs = opts.mcpArgs(stagingDir)
+	}
+	sessionReq := newACPSessionRequestWithArgs(stagingDir, mcpArgs)
 	if err := sendACPRequest(stdin, sessionReq); err != nil {
 		return TurnResult{}, fmt.Errorf("send session/new: %w", err)
 	}
@@ -369,7 +386,15 @@ func (b *ACPBackend) runACPTurnFull(ctx context.Context, prompt string, valOpts 
 	}
 
 	// 6. Stream events until completion.
-	var summary string
+	//
+	// The Claude ACP adapter streams the agent's textual answer as a series of
+	// session/update notifications with sessionUpdate="agent_message_chunk"; the
+	// final session/prompt response (id=3) does NOT carry the answer text. So we
+	// accumulate the chunk text and use it as the turn summary when the final
+	// response text is empty (which it is for the Claude adapter). This matters
+	// for query, whose entire output IS the answer text.
+	var responseText string
+	var chunks strings.Builder
 	promptCompleted := false
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -384,7 +409,7 @@ func (b *ACPBackend) runACPTurnFull(ctx context.Context, prompt string, valOpts 
 
 		// Check for errors.
 		if resp.Error != nil {
-			return TurnResult{Summary: summary}, fmt.Errorf("ACP error %d: %s", resp.Error.Code, resp.Error.Message)
+			return TurnResult{Summary: chunks.String()}, fmt.Errorf("ACP error %d: %s", resp.Error.Code, resp.Error.Message)
 		}
 
 		// If this is a response to our prompt request (id=3), we're done.
@@ -395,15 +420,25 @@ func (b *ACPBackend) runACPTurnFull(ctx context.Context, prompt string, valOpts 
 					Text string `json:"text"`
 				}
 				_ = json.Unmarshal(resp.Result, &promptResult)
-				summary = promptResult.Text
+				responseText = promptResult.Text
 			}
 			break
 		}
 
-		// Otherwise it's a notification/update — log and continue.
+		// Otherwise it's a notification/update — accumulate agent message text.
 		if resp.Method != "" {
+			if text := agentMessageChunkText(resp.Params); text != "" {
+				chunks.WriteString(text)
+			}
+			if os.Getenv("ENGRAM9_ACP_DEBUG") != "" {
+				log.Printf("[acp-debug] %s params=%s", resp.Method, string(resp.Params))
+			}
 			log.Printf("[acp] notification: %s", resp.Method)
 		}
+	}
+	summary := responseText
+	if summary == "" {
+		summary = chunks.String()
 	}
 	if err := scanner.Err(); err != nil {
 		return TurnResult{Summary: summary}, fmt.Errorf("read acp output: %w", err)
@@ -412,7 +447,25 @@ func (b *ACPBackend) runACPTurnFull(ctx context.Context, prompt string, valOpts 
 		return TurnResult{Summary: summary}, fmt.Errorf("read acp output: prompt response missing: %w", io.EOF)
 	}
 
-	// 7. Validate staging wiki.
+	// 7–8. Commit gate: validate → preMerge → merge (or discard). Extracted into
+	// commitStagingTurn so the failure-atomic tests exercise the SAME ordered
+	// decision path production uses (an ordering regression — e.g. merge before
+	// preMerge — must fail those tests, not just a hand-orchestrated replica).
+	return b.commitStagingTurn(stagingDir, summary, valOpts, opts)
+}
+
+// commitStagingTurn runs the ordered commit gate against a prepared staging dir:
+//  1. validate staging against production (taxonomy/frontmatter/diff/paired-move);
+//     any violation → return without merge (staging discarded by the caller).
+//  2. preMerge hook (compile receipt validation) → error → return without merge
+//     (staging discarded). This MUST run BEFORE merge so an invalid receipt
+//     leaves the live store — wiki, archive, index, .meta, cursor — exactly as
+//     before (invariant 11 / A2 failure-atomicity).
+//  3. merge staging → production (skipped for read-only query turns).
+//
+// The ordering (validate → preMerge → merge) is the load-bearing property: it is
+// shared by production turns and the failure-atomic tests via this one function.
+func (b *ACPBackend) commitStagingTurn(stagingDir, summary string, valOpts ValidateOptions, opts acpTurnOptions) (TurnResult, error) {
 	violations, err := b.validator.Validate(b.dataDir, stagingDir, valOpts)
 	if err != nil {
 		return TurnResult{Summary: summary}, fmt.Errorf("validate staging: %w", err)
@@ -421,7 +474,15 @@ func (b *ACPBackend) runACPTurnFull(ctx context.Context, prompt string, valOpts 
 		return TurnResult{Summary: summary, Violations: violations}, nil
 	}
 
-	// 8. Merge staging wiki -> production.
+	if opts.preMerge != nil {
+		if err := opts.preMerge(stagingDir); err != nil {
+			return TurnResult{Summary: summary}, err
+		}
+	}
+
+	if opts.skipMerge {
+		return TurnResult{Summary: summary, Merged: false}, nil
+	}
 	if err := mergeWiki(stagingDir, b.dataDir); err != nil {
 		return TurnResult{Summary: summary}, fmt.Errorf("merge staging: %w", err)
 	}
@@ -452,13 +513,83 @@ type acpError struct {
 	Message string `json:"message"`
 }
 
-func acpmuxArgs(provider string) []string {
+// agentMessageChunkText extracts the text of a session/update notification that
+// carries an agent_message_chunk. Other update kinds (status, tool_call,
+// tool_call_update, plan, usage) return "". The Claude adapter streams the
+// answer as these chunks; the final prompt response text is empty, so this is
+// the only source of the agent's textual output. Verified against real acpmux
+// payloads:
+//
+//	{"sessionId":...,"update":{"sessionUpdate":"agent_message_chunk",
+//	 "content":{"type":"text","text":"..."}}}
+func agentMessageChunkText(params json.RawMessage) string {
+	if len(params) == 0 {
+		return ""
+	}
+	var p struct {
+		Update struct {
+			SessionUpdate string `json:"sessionUpdate"`
+			Content       struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"update"`
+	}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return ""
+	}
+	if p.Update.SessionUpdate != "agent_message_chunk" {
+		return ""
+	}
+	if p.Update.Content.Type != "text" {
+		return ""
+	}
+	return p.Update.Content.Text
+}
+
+// engram9 MCP tool names, prefixed as the Claude adapter exposes injected MCP
+// tools (mcp__<server>__<tool>). The --allowedTools whitelist below is the
+// runtime capability boundary: a tool the mode needs but omits here is simply
+// not callable by the agent, so its whole flow silently no-ops (e.g. compile
+// without read_events_since produces no receipt). The whitelist MUST match the
+// mode's mcp tool surface (mcp.CompileMCPTools / QueryMCPTools / AgentMCPTools).
+const (
+	mcpToolReadWikiIndex   = "mcp__engram9__read_wiki_index"
+	mcpToolReadWikiPage    = "mcp__engram9__read_wiki_page"
+	mcpToolWriteWikiPage   = "mcp__engram9__write_wiki_page"
+	mcpToolSearchWiki      = "mcp__engram9__search_wiki"
+	mcpToolReadEventsSince = "mcp__engram9__read_events_since"
+	mcpToolArchiveWikiPage = "mcp__engram9__archive_wiki_page"
+	mcpToolRebuildIndex    = "mcp__engram9__rebuild_index"
+)
+
+// agentAllowedTools is the default (ingest/batch) capability surface.
+var agentAllowedTools = []string{
+	mcpToolReadWikiIndex, mcpToolReadWikiPage, mcpToolWriteWikiPage, mcpToolSearchWiki,
+}
+
+// compileAllowedTools adds the compile-only tools (read_events_since,
+// archive_wiki_page, rebuild_index) to the agent wiki tools.
+var compileAllowedTools = []string{
+	mcpToolReadWikiIndex, mcpToolReadWikiPage, mcpToolWriteWikiPage, mcpToolSearchWiki,
+	mcpToolReadEventsSince, mcpToolArchiveWikiPage, mcpToolRebuildIndex,
+}
+
+// queryAllowedTools is the strictly read-only query surface: NO write tool.
+var queryAllowedTools = []string{
+	mcpToolReadWikiIndex, mcpToolReadWikiPage, mcpToolSearchWiki,
+}
+
+func acpmuxArgs(provider string, allowedTools []string) []string {
+	if len(allowedTools) == 0 {
+		allowedTools = agentAllowedTools
+	}
 	return []string{
 		"--provider", provider,
 		"--provider-arg", "--tools",
 		"--provider-arg", "ToolSearch,Glob,Grep",
 		"--provider-arg", "--allowedTools",
-		"--provider-arg", "mcp__engram9__read_wiki_index,mcp__engram9__read_wiki_page,mcp__engram9__write_wiki_page,mcp__engram9__search_wiki",
+		"--provider-arg", strings.Join(allowedTools, ","),
 		"--provider-arg", "--permission-mode",
 		"--provider-arg", "dontAsk",
 		"--provider-arg", "--strict-mcp-config",
@@ -466,6 +597,13 @@ func acpmuxArgs(provider string) []string {
 }
 
 func newACPSessionRequest(stagingDir string) acpRequest {
+	return newACPSessionRequestWithArgs(stagingDir, []string{"-data", stagingDir, "-mode", "agent"})
+}
+
+// newACPSessionRequestWithArgs builds a session/new request whose engram9 MCP
+// server is launched with the given args. Compile and query modes pass their
+// mode plus (for compile) -turn-id/-event-bound/-receipt here.
+func newACPSessionRequestWithArgs(stagingDir string, mcpArgs []string) acpRequest {
 	return acpRequest{
 		JSONRPC: "2.0",
 		ID:      json.RawMessage(`2`),
@@ -477,7 +615,7 @@ func newACPSessionRequest(stagingDir string) acpRequest {
 					"name":    "engram9",
 					"type":    "stdio",
 					"command": "engram9-mcp",
-					"args":    []string{"-data", stagingDir, "-mode", "agent"},
+					"args":    mcpArgs,
 				},
 			},
 		}),

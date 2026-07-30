@@ -24,6 +24,12 @@ type Store interface {
 	// Automatically updates sidecar last_accessed and access_dates.
 	ReadWikiPage(path string) (*WikiPage, error)
 
+	// ReadWikiPageReadOnly reads a wiki page and its sidecar metadata WITHOUT
+	// any store mutation — no access-telemetry writeback to the sidecar.
+	// Used by the query capability, whose read-only guarantee (invariant 12)
+	// requires zero store mutation including .meta.
+	ReadWikiPageReadOnly(path string) (*WikiPage, error)
+
 	// SearchWiki performs a text search across all wiki pages (including archive).
 	SearchWiki(query string) ([]SearchResult, error)
 

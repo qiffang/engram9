@@ -62,10 +62,11 @@ type Handler struct {
 	llmBaseURL       string
 
 	// Per-capability backend identifiers for /status.
-	wikiBackendName  string // "llm" or "acp"
-	queryBackendName string // "llm"
-	acpProvider      string // "claude" (Phase 1) — only when wikiBackendName=="acp"
-	adminToken       string
+	wikiBackendName    string // "llm" or "acp"
+	compileBackendName string // "llm" or "acp"
+	queryBackendName   string // "llm" or "acp"
+	acpProvider        string // e.g. "claude" — set when any capability is "acp"
+	adminToken         string
 }
 
 const (
@@ -88,11 +89,13 @@ type Options struct {
 	LLMModel                     string
 	LLMBaseURL                   string
 
-	// WikiBackend selects the backend for ingest + compile: "llm" (default) or "acp".
+	// WikiBackend selects the backend for ingest: "acp" (default) or "llm".
 	WikiBackend string
-	// QueryBackend selects the backend for query: "llm" (default). "acp" is not yet supported.
+	// CompileBackend selects the backend for compile: "acp" (default) or "llm".
+	CompileBackend string
+	// QueryBackend selects the backend for query: "acp" (default) or "llm".
 	QueryBackend string
-	// ACPConfig is required when WikiBackend == "acp".
+	// ACPConfig is required when any of WikiBackend/CompileBackend/QueryBackend == "acp".
 	ACPConfig *agent.ACPBackendConfig
 	// CoordinatorConfig controls ACP batch scheduling. Zero fields use defaults.
 	CoordinatorConfig agent.CoordinatorConfig
@@ -136,49 +139,76 @@ func NewWithOptions(dataDir string, llm agent.LLM, opts Options) (*Handler, erro
 	}
 
 	// Resolve wiki backend (ingest only in Phase 1).
+	// Default to ACP (Claude Code / Codex) for every capability — the wiki flow
+	// runs through an agent by default, never the apikey LLM path. LLM is used
+	// only when a capability is EXPLICITLY "llm"; never a silent fallback.
 	wikiBackendName := opts.WikiBackend
 	if wikiBackendName == "" {
-		wikiBackendName = "llm"
+		wikiBackendName = "acp"
+	}
+	compileBackendName := opts.CompileBackend
+	if compileBackendName == "" {
+		compileBackendName = "acp"
+	}
+	queryBackendName := opts.QueryBackend
+	if queryBackendName == "" {
+		queryBackendName = "acp"
 	}
 
-	// Compile always uses LLM backend in Phase 1 — ACP agent mode does not
-	// expose compile tools (read_events_since, archive_wiki_page, rebuild_index).
-	llmExecutor := agent.NewToolExecutor(store)
-	compileBackend := agent.NewLLMBackend(llm, llmExecutor, runnerOpts)
-
-	var wikiBackend agent.AgentBackend
+	// A single ACP backend serves whichever capabilities are configured as acp;
+	// it is constructed once here and shared. `acp` for ANY capability requires
+	// ACP config, else fail fast at init (no silent LLM fallback — silent apikey
+	// use is exactly what motivated Phase 2). I5: the LLM client is only
+	// constructed by the caller when some capability is llm; a capability on acp
+	// never touches an LLM client.
+	var acpBackend *agent.ACPBackend
 	var acpProvider string
-	switch wikiBackendName {
-	case "llm":
-		wikiBackend = compileBackend // reuse same LLM backend
-	case "acp":
+	anyACP := wikiBackendName == "acp" || compileBackendName == "acp" || queryBackendName == "acp"
+	if anyACP {
 		if opts.ACPConfig == nil {
-			return nil, fmt.Errorf("WIKI_BACKEND=acp requires ACP configuration (ACP_PROVIDER, ACPMUX_COMMAND)")
+			return nil, fmt.Errorf("a capability is set to acp but ACP configuration is missing (ACP_PROVIDER, ACPMUX_COMMAND)")
 		}
 		acpProvider = opts.ACPConfig.Provider
-		acpBackend, err := agent.NewACPBackend(dataDir, *opts.ACPConfig)
+		b, err := agent.NewACPBackend(dataDir, *opts.ACPConfig)
 		if err != nil {
 			return nil, fmt.Errorf("init ACP backend: %w", err)
 		}
-		wikiBackend = acpBackend
-	default:
-		return nil, fmt.Errorf("unknown WIKI_BACKEND %q (use 'llm' or 'acp')", wikiBackendName)
+		acpBackend = b
 	}
 
-	// Resolve query backend.
-	queryBackendName := opts.QueryBackend
-	if queryBackendName == "" {
-		queryBackendName = "llm"
+	// resolveBackend returns the LLM or ACP backend for a capability, failing
+	// fast on an unknown name.
+	llmExecutor := agent.NewToolExecutor(store)
+	newLLM := func() agent.AgentBackend { return agent.NewLLMBackend(llm, agent.NewToolExecutor(store), runnerOpts) }
+	resolveBackend := func(capability, name string) (agent.AgentBackend, error) {
+		switch name {
+		case "llm":
+			return newLLM(), nil
+		case "acp":
+			return acpBackend, nil
+		default:
+			return nil, fmt.Errorf("unknown %s backend %q (use 'llm' or 'acp')", capability, name)
+		}
 	}
 
-	var queryBackend agent.AgentBackend
-	switch queryBackendName {
+	wikiBackend, err := resolveBackend("WIKI_BACKEND", wikiBackendName)
+	if err != nil {
+		return nil, err
+	}
+	// The compile capability keeps the shared llmExecutor for the LLM path so
+	// existing compile behavior is byte-identical when compile_backend=llm.
+	var compileBackend agent.AgentBackend
+	switch compileBackendName {
 	case "llm":
-		queryBackend = agent.NewLLMBackend(llm, agent.NewToolExecutor(store), runnerOpts)
+		compileBackend = agent.NewLLMBackend(llm, llmExecutor, runnerOpts)
 	case "acp":
-		return nil, fmt.Errorf("QUERY_BACKEND=acp is not yet supported; query ACP requires additional design (session lifecycle, latency, read-only MCP tools)")
+		compileBackend = acpBackend
 	default:
-		return nil, fmt.Errorf("unknown QUERY_BACKEND %q (use 'llm')", queryBackendName)
+		return nil, fmt.Errorf("unknown COMPILE_BACKEND %q (use 'llm' or 'acp')", compileBackendName)
+	}
+	queryBackend, err := resolveBackend("QUERY_BACKEND", queryBackendName)
+	if err != nil {
+		return nil, err
 	}
 
 	handler := &Handler{
@@ -199,12 +229,13 @@ func NewWithOptions(dataDir string, llm agent.LLM, opts Options) (*Handler, erro
 		llmModel:                     opts.LLMModel,
 		llmBaseURL:                   opts.LLMBaseURL,
 		wikiBackendName:              wikiBackendName,
+		compileBackendName:           compileBackendName,
 		queryBackendName:             queryBackendName,
 		acpProvider:                  acpProvider,
 		adminToken:                   os.Getenv("ENGRAM9_ADMIN_TOKEN"),
 	}
 	if wikiBackendName == "acp" {
-		acpBackend := wikiBackend.(*agent.ACPBackend)
+		// Batch ingest is ingest-specific; use the shared ACP backend directly.
 		pendingStore, storeErr := agent.NewPendingEventStore(dataDir, agent.NewStoreEventSource(store), agent.StoreConfig{
 			BootstrapEpoch: os.Getenv("BATCH_INGEST_EPOCH"),
 		})
@@ -497,7 +528,7 @@ func (h *Handler) handleStatus(w http.ResponseWriter, r *http.Request) {
 		LLMModel:                     h.llmModel,
 		LLMBaseURL:                   h.llmBaseURL,
 		IngestBackend:                h.wikiBackendName,
-		CompileBackend:               "llm", // always LLM in Phase 1
+		CompileBackend:               h.compileBackendName,
 		QueryBackend:                 h.queryBackendName,
 		ACPProvider:                  h.acpProvider,
 		BatchIngest:                  batchIngest,

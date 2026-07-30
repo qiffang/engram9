@@ -2,29 +2,16 @@ package agent
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
-	"errors"
 	"reflect"
 	"strings"
 	"testing"
 )
 
-func TestACPBackendRunQueryReturnsErrNotImplemented(t *testing.T) {
-	b := &ACPBackend{}
-	_, err := b.RunQuery(context.Background(), "test", nil, nil)
-	if !errors.Is(err, ErrNotImplemented) {
-		t.Fatalf("ACPBackend.RunQuery() error=%v, want ErrNotImplemented", err)
-	}
-}
-
-func TestACPBackendRunCompileReturnsErrNotImplemented(t *testing.T) {
-	b := &ACPBackend{}
-	_, err := b.RunCompile(context.Background(), 0)
-	if !errors.Is(err, ErrNotImplemented) {
-		t.Fatalf("ACPBackend.RunCompile() error=%v, want ErrNotImplemented", err)
-	}
-}
+// RunCompile / RunQuery are now implemented (canon9-ai #41). Their deterministic
+// logic (receipt validation, recall injection) is covered by the tests in
+// backend_acp_compile_test.go and backend_acp_query_test.go; the full ACP turn
+// requires a real acpmux+claude E2E per the #41 §10 gate.
 
 func TestNewACPBackendRejectsNonClaudeProvider(t *testing.T) {
 	_, err := NewACPBackend(t.TempDir(), ACPBackendConfig{Provider: "codex"})
@@ -33,19 +20,114 @@ func TestNewACPBackendRejectsNonClaudeProvider(t *testing.T) {
 	}
 }
 
-func TestACPMuxArgsRestrictClaudeTools(t *testing.T) {
-	want := []string{
+// wantACPMuxArgs builds the expected acpmux args for a given allowedTools CSV.
+func wantACPMuxArgs(allowedCSV string) []string {
+	return []string{
 		"--provider", "claude",
 		"--provider-arg", "--tools",
 		"--provider-arg", "ToolSearch,Glob,Grep",
 		"--provider-arg", "--allowedTools",
-		"--provider-arg", "mcp__engram9__read_wiki_index,mcp__engram9__read_wiki_page,mcp__engram9__write_wiki_page,mcp__engram9__search_wiki",
+		"--provider-arg", allowedCSV,
 		"--provider-arg", "--permission-mode",
 		"--provider-arg", "dontAsk",
 		"--provider-arg", "--strict-mcp-config",
 	}
-	if got := acpmuxArgs("claude"); !reflect.DeepEqual(got, want) {
-		t.Fatalf("acpmuxArgs() = %#v, want %#v", got, want)
+}
+
+func TestACPMuxArgsDefaultsToAgentTools(t *testing.T) {
+	// Empty allowedTools ⇒ the agent (ingest) surface.
+	want := wantACPMuxArgs("mcp__engram9__read_wiki_index,mcp__engram9__read_wiki_page,mcp__engram9__write_wiki_page,mcp__engram9__search_wiki")
+	if got := acpmuxArgs("claude", nil); !reflect.DeepEqual(got, want) {
+		t.Fatalf("acpmuxArgs(agent) = %#v, want %#v", got, want)
+	}
+}
+
+// TestACPMuxArgsCompileWhitelistsCompileTools guards the bug the real E2E
+// caught: compile turns need read_events_since / archive_wiki_page /
+// rebuild_index in --allowedTools, or the agent cannot call read_events_since
+// and the compile produces no receipt (unknown(no_valid_receipt)).
+func TestACPMuxArgsCompileWhitelistsCompileTools(t *testing.T) {
+	want := wantACPMuxArgs("mcp__engram9__read_wiki_index,mcp__engram9__read_wiki_page,mcp__engram9__write_wiki_page,mcp__engram9__search_wiki,mcp__engram9__read_events_since,mcp__engram9__archive_wiki_page,mcp__engram9__rebuild_index")
+	if got := acpmuxArgs("claude", compileAllowedTools); !reflect.DeepEqual(got, want) {
+		t.Fatalf("acpmuxArgs(compile) = %#v, want %#v", got, want)
+	}
+	// The compile whitelist MUST include read_events_since (receipt source).
+	found := false
+	for _, tool := range compileAllowedTools {
+		if tool == mcpToolReadEventsSince {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("compileAllowedTools must include read_events_since")
+	}
+}
+
+// TestACPMuxArgsQueryOmitsWriteTools enforces the read-only query surface: no
+// write_wiki_page, no read_events_since, no archive, no rebuild.
+func TestACPMuxArgsQueryOmitsWriteTools(t *testing.T) {
+	want := wantACPMuxArgs("mcp__engram9__read_wiki_index,mcp__engram9__read_wiki_page,mcp__engram9__search_wiki")
+	if got := acpmuxArgs("claude", queryAllowedTools); !reflect.DeepEqual(got, want) {
+		t.Fatalf("acpmuxArgs(query) = %#v, want %#v", got, want)
+	}
+	forbidden := map[string]bool{
+		mcpToolWriteWikiPage:   true,
+		mcpToolReadEventsSince: true,
+		mcpToolArchiveWikiPage: true,
+		mcpToolRebuildIndex:    true,
+	}
+	for _, tool := range queryAllowedTools {
+		if forbidden[tool] {
+			t.Fatalf("queryAllowedTools must not include mutating tool %q", tool)
+		}
+	}
+}
+
+// TestAgentMessageChunkText verifies the answer-text extraction against the
+// real acpmux session/update wire shapes. The Claude adapter streams the answer
+// as agent_message_chunk notifications; the final prompt response is empty, so
+// this parser is the only source of the query answer.
+func TestAgentMessageChunkText(t *testing.T) {
+	cases := []struct {
+		name   string
+		params string
+		want   string
+	}{
+		{
+			name:   "agent_message_chunk text",
+			params: `{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hello world"}}}`,
+			want:   "hello world",
+		},
+		{
+			name:   "status update ignored",
+			params: `{"sessionId":"s1","update":{"sessionUpdate":"status","status":"running","message":"claude turn started"}}`,
+			want:   "",
+		},
+		{
+			name:   "tool_call ignored",
+			params: `{"sessionId":"s1","update":{"sessionUpdate":"tool_call","toolCallId":"t1","title":"ToolSearch","status":"in_progress"}}`,
+			want:   "",
+		},
+		{
+			name:   "tool_call_update text-content ignored (not the agent's message)",
+			params: `{"sessionId":"s1","update":{"sessionUpdate":"tool_call_update","content":[{"type":"text","text":"tool result"}],"toolCallId":"t1","status":"completed"}}`,
+			want:   "",
+		},
+		{
+			name:   "non-text content ignored",
+			params: `{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"image"}}}`,
+			want:   "",
+		},
+		{name: "empty params", params: "", want: ""},
+		{name: "malformed json", params: "{not json", want: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := agentMessageChunkText(json.RawMessage(tc.params))
+			if got != tc.want {
+				t.Fatalf("agentMessageChunkText(%s) = %q, want %q", tc.params, got, tc.want)
+			}
+		})
 	}
 }
 

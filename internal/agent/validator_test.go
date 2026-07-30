@@ -216,6 +216,154 @@ func TestWikiValidatorAllowsDeleteWhenEnabled(t *testing.T) {
 	}
 }
 
+// TestWikiValidatorAllowsFaithfulArchiveMove (regression #1, positive) models
+// sleep-pruning: the compile agent archives an active page — ArchiveWikiPage
+// renames wiki/semantic/b.md -> wiki/archive/semantic/b.md byte-identically.
+// Under AllowPairedArchiveMove the original's removal is fine and the archived
+// copy is exempt from taxonomy/frontmatter checks. Before Blocker-1 fix this
+// scenario produced three violations and every pruning compile was discarded.
+func TestWikiValidatorAllowsFaithfulArchiveMove(t *testing.T) {
+	prod := t.TempDir()
+	staging := t.TempDir()
+
+	const bContent = validFrontmatter // the exact former active bytes
+	writeTestFile(t, prod, "wiki/semantic/a.md", validFrontmatter)
+	writeTestFile(t, prod, "wiki/semantic/b.md", bContent)
+	// Keep a.md active; move b.md into archive/ byte-identically.
+	writeTestFile(t, staging, "wiki/semantic/a.md", validFrontmatter)
+	writeTestFile(t, staging, "wiki/archive/semantic/b.md", bContent)
+
+	v := NewWikiValidator(DefaultACPMaxDiffBytes)
+	violations, err := v.Validate(prod, staging, ValidateOptions{AllowPairedArchiveMove: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(violations) != 0 {
+		t.Fatalf("faithful archive move must pass validation, got: %v", violations)
+	}
+}
+
+// TestWikiValidatorRejectsUnpairedDelete (regression #2, the DISCRIMINATING
+// test) is what separates the paired-move contract from a blanket AllowDelete:
+// an active page removed with NO archive/ copy must still be rejected even under
+// AllowPairedArchiveMove. A blanket-true implementation would wrongly pass this,
+// granting the compile agent destruction capability.
+func TestWikiValidatorRejectsUnpairedDelete(t *testing.T) {
+	prod := t.TempDir()
+	staging := t.TempDir()
+
+	writeTestFile(t, prod, "wiki/semantic/a.md", validFrontmatter)
+	writeTestFile(t, prod, "wiki/semantic/b.md", validFrontmatter)
+	// b.md deleted with NO archive/ copy — destruction, not a move.
+	writeTestFile(t, staging, "wiki/semantic/a.md", validFrontmatter)
+
+	v := NewWikiValidator(DefaultACPMaxDiffBytes)
+	violations, err := v.Validate(prod, staging, ValidateOptions{AllowPairedArchiveMove: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, vi := range violations {
+		if vi.Path == "semantic/b.md" && contains(vi.Message, "deleted") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("unpaired delete must be rejected even with AllowPairedArchiveMove, got: %v", violations)
+	}
+}
+
+// TestWikiValidatorRejectsMismatchedArchive (regression #1, negative) guards the
+// byte-identical precondition: if archive/P differs from the former active P,
+// the taxonomy exemption must NOT apply — the agent cannot smuggle rewritten or
+// arbitrary content into archive/ under the guise of an archive move.
+func TestWikiValidatorRejectsMismatchedArchive(t *testing.T) {
+	prod := t.TempDir()
+	staging := t.TempDir()
+
+	writeTestFile(t, prod, "wiki/semantic/a.md", validFrontmatter)
+	writeTestFile(t, prod, "wiki/semantic/b.md", validFrontmatter)
+	writeTestFile(t, staging, "wiki/semantic/a.md", validFrontmatter)
+	// archive/b.md content does NOT match the former active b.md — a rewrite,
+	// not a faithful move.
+	writeTestFile(t, staging, "wiki/archive/semantic/b.md", "# smuggled\n\ntotally different content\n")
+
+	v := NewWikiValidator(DefaultACPMaxDiffBytes)
+	violations, err := v.Validate(prod, staging, ValidateOptions{AllowPairedArchiveMove: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Two independent rejections are acceptable; require at least one that ties
+	// the failure to the mismatch (deleted-without-copy OR non-taxonomy archive).
+	if len(violations) == 0 {
+		t.Fatalf("mismatched archive must be rejected (deleted b.md has no faithful archive copy), got no violations")
+	}
+}
+
+// TestWikiValidatorRejectsModifiedExistingArchive (regression: archive/** edit)
+// guards that an already-archived page cannot be rewritten in place. The
+// exemption is only for a fresh faithful move (archive/P byte-identical to the
+// former ACTIVE prod P). An edit to a pre-existing archive/P has no matching
+// active source, so it falls through to ordinary validation and is rejected on
+// its non-taxonomy path — the agent cannot silently overwrite archive history.
+func TestWikiValidatorRejectsModifiedExistingArchive(t *testing.T) {
+	prod := t.TempDir()
+	staging := t.TempDir()
+
+	// A page that is ALREADY archived in production (no active source).
+	writeTestFile(t, prod, "wiki/archive/semantic/old.md", "# old archived\n\noriginal archive content\n")
+	writeTestFile(t, prod, "wiki/semantic/a.md", validFrontmatter)
+	writeTestFile(t, staging, "wiki/semantic/a.md", validFrontmatter)
+	// Staging REWRITES the existing archived page — must be rejected.
+	writeTestFile(t, staging, "wiki/archive/semantic/old.md", "# tampered\n\nrewritten archive content\n")
+
+	v := NewWikiValidator(DefaultACPMaxDiffBytes)
+	violations, err := v.Validate(prod, staging, ValidateOptions{AllowPairedArchiveMove: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, vi := range violations {
+		if vi.Path == "archive/semantic/old.md" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("modifying an existing archive/ page must be rejected, got: %v", violations)
+	}
+}
+
+// TestWikiValidatorRejectsDeletedExistingArchive (regression: archive/** delete)
+// closes the gap adversary-1 caught at 6176f35: mergeWiki replaces the whole
+// wiki/ subtree, so a staging tree that OMITS an existing archived page would
+// silently delete archive history on merge. archive/** is append-only under the
+// paired-move contract — a missing existing archived page must be rejected.
+func TestWikiValidatorRejectsDeletedExistingArchive(t *testing.T) {
+	prod := t.TempDir()
+	staging := t.TempDir()
+
+	// An existing archived page in production.
+	writeTestFile(t, prod, "wiki/archive/semantic/old.md", "# old\n\narchived history\n")
+	writeTestFile(t, prod, "wiki/semantic/a.md", validFrontmatter)
+	// Staging keeps a.md but DROPS the archived page (deletes archive history).
+	writeTestFile(t, staging, "wiki/semantic/a.md", validFrontmatter)
+
+	v := NewWikiValidator(DefaultACPMaxDiffBytes)
+	violations, err := v.Validate(prod, staging, ValidateOptions{AllowPairedArchiveMove: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, vi := range violations {
+		if vi.Path == "archive/semantic/old.md" && contains(vi.Message, "append-only") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("deleting an existing archived page must be rejected (append-only), got: %v", violations)
+	}
+}
+
 func TestWikiValidatorAllowsMetaSidecars(t *testing.T) {
 	prod := t.TempDir()
 	staging := t.TempDir()
