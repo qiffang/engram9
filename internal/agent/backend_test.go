@@ -291,7 +291,8 @@ func TestNewACPBackendFailsClosedWhenEngram9McpMissing(t *testing.T) {
 }
 
 func TestNewACPBackendResolvesEngram9McpFromExplicitPath(t *testing.T) {
-	// An explicit, existing, executable path is honored verbatim.
+	// An explicit, existing, executable path is validated and resolved to an
+	// absolute path (not used as-is).
 	_, err := NewACPBackend(t.TempDir(), ACPBackendConfig{
 		Provider:          "claude",
 		AcpmuxCommand:     "/bin/sh",
@@ -437,17 +438,23 @@ func TestSessionRequestUsesAbsoluteMcpCommand(t *testing.T) {
 	}
 }
 
-// Task #66 review (adversary-1): an owner-non-executable file must be rejected —
-// mode&0o111 could see an other/group x-bit that this process cannot use, so
-// resolution relies on exec.LookPath's effective-permission check.
+// Task #66 review (adversary-1/adversary-2): an owner-non-executable file must
+// be rejected. The mode MUST be discriminating between the old mode&0o111 check
+// and the current exec.LookPath check: 0o001 sets ONLY the other-execute bit, so
+// mode&0o111 != 0 is true (the buggy check would ALLOW it), while this process —
+// the file owner — has no owner-execute bit, so exec.LookPath's effective-
+// permission check REJECTS it. A blanket 0o400 (no x bit anywhere) would be
+// rejected by both implementations and thus fail to lock the fix in place.
 func TestResolveEngram9McpCommandRejectsOwnerNonExecutable(t *testing.T) {
 	dir := t.TempDir()
 	f := filepath.Join(dir, "engram9-mcp")
-	// 0o400: readable by owner, NOT executable by anyone.
-	if err := os.WriteFile(f, []byte("#!/bin/sh\nexit 0\n"), 0o400); err != nil {
+	// 0o001: other-execute set, owner-execute NOT set. mode&0o111 would see an
+	// x-bit and wrongly allow; the running owner cannot execute it, so LookPath
+	// (effective permission) correctly rejects.
+	if err := os.WriteFile(f, []byte("#!/bin/sh\nexit 0\n"), 0o001); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := resolveEngram9McpCommand(f); err == nil {
-		t.Fatal("a non-executable file must be rejected (effective permission)")
+		t.Fatal("an owner-non-executable file must be rejected (effective permission, not mode&0o111)")
 	}
 }

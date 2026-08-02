@@ -649,8 +649,9 @@ func acpmuxArgs(provider string, allowedTools []string) []string {
 // engram9 executable (os.Executable() sibling) before falling back to PATH.
 // This makes a correct deployment "install both files into one directory" and
 // structurally removes pairing skew from an ambient/interactive PATH. An
-// absolute or relative path with a separator is honored verbatim (and checked
-// for existence + executability). Returns an error if nothing is resolvable.
+// absolute or relative path with a separator is validated (existence +
+// executability) and returned as an absolute path — the input string is NOT
+// used as-is. Returns an error if nothing is resolvable.
 // The returned command is ALWAYS an absolute path so it resolves to the same
 // executable regardless of the process cwd. This matters because the command is
 // validated here (in engram9's cwd) but used later in session/new whose spawn
