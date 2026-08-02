@@ -436,3 +436,18 @@ func TestSessionRequestUsesAbsoluteMcpCommand(t *testing.T) {
 		t.Fatalf("session/new must carry the absolute mcp command; got req=%s", string(raw))
 	}
 }
+
+// Task #66 review (adversary-1): an owner-non-executable file must be rejected —
+// mode&0o111 could see an other/group x-bit that this process cannot use, so
+// resolution relies on exec.LookPath's effective-permission check.
+func TestResolveEngram9McpCommandRejectsOwnerNonExecutable(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "engram9-mcp")
+	// 0o400: readable by owner, NOT executable by anyone.
+	if err := os.WriteFile(f, []byte("#!/bin/sh\nexit 0\n"), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveEngram9McpCommand(f); err == nil {
+		t.Fatal("a non-executable file must be rejected (effective permission)")
+	}
+}
