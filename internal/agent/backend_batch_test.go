@@ -227,7 +227,11 @@ func newScriptedACPBackend(t *testing.T, scriptBody string) *ACPBackend {
 	scriptPath := filepath.Join(t.TempDir(), "acpmux")
 	require.NoError(t, os.WriteFile(scriptPath, []byte("#!/bin/sh\nset -eu\n"+scriptBody), 0o755))
 	backend, err := NewACPBackend(dataDir, ACPBackendConfig{
-		Provider: "claude", AcpmuxCommand: scriptPath, TurnTimeout: time.Second,
+		// Engram9McpCommand is set to a resolvable stand-in (the same fixture
+		// script) so NewACPBackend's fail-closed companion check (task #66) is
+		// satisfied without relying on an ambient-PATH engram9-mcp. These tests
+		// use scripted ACP responses and never launch the real companion.
+		Provider: "claude", AcpmuxCommand: scriptPath, Engram9McpCommand: scriptPath, TurnTimeout: time.Second,
 	})
 	require.NoError(t, err)
 	return backend

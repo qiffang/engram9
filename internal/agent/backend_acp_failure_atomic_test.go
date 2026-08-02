@@ -224,7 +224,9 @@ echo '{"jsonrpc":"2.0","id":3,"result":{"text":"done (no receipt written)"}}'
 	require.NoError(t, os.WriteFile(scriptPath, []byte(script), 0o755))
 
 	b, err := NewACPBackend(dataDir, ACPBackendConfig{
-		Provider: "claude", AcpmuxCommand: scriptPath, TurnTimeout: 10 * time.Second,
+		// Engram9McpCommand: resolvable stand-in for the fail-closed companion
+		// check (task #66); scripted-ACP tests never launch the real companion.
+		Provider: "claude", AcpmuxCommand: scriptPath, Engram9McpCommand: scriptPath, TurnTimeout: 10 * time.Second,
 	})
 	require.NoError(t, err)
 
