@@ -3,6 +3,8 @@ package agent
 import (
 	"bufio"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -360,5 +362,77 @@ func TestChunkBoundaryFixMakesVerdictParse(t *testing.T) {
 	post := parseEventResults(batch, b.String(), "")
 	if len(post) != 1 || post[0].Status != "integrated" {
 		t.Fatalf("separated summary must parse the verdict as integrated; got %+v", post)
+	}
+}
+
+// Task #66 review (architect-1 / adversary-1): the resolved engram9-mcp command
+// must be ABSOLUTE so it resolves to the same executable in any cwd — it is
+// verified in engram9's cwd but used in session/new whose spawn cwd is the
+// staging dir. A relative path that verified could fail (or resolve elsewhere)
+// at spawn time, reopening the fail-open window.
+func TestResolveEngram9McpCommandReturnsAbsolutePath(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "engram9-mcp")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Resolve using a RELATIVE explicit path from within `dir`, then assert the
+	// result is absolute and cwd-independent.
+	orig, _ := os.Getwd()
+	defer func() { _ = os.Chdir(orig) }()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := resolveEngram9McpCommand("./engram9-mcp")
+	if err != nil {
+		t.Fatalf("expected relative explicit path to resolve; got %v", err)
+	}
+	if !filepath.IsAbs(resolved) {
+		t.Fatalf("resolved command must be absolute (cwd-independent); got %q", resolved)
+	}
+	// Changing cwd must not change what the resolved command points to.
+	if err := os.Chdir(orig); err != nil {
+		t.Fatal(err)
+	}
+	if _, statErr := os.Stat(resolved); statErr != nil {
+		t.Fatalf("absolute resolved command must still resolve after cwd change; got %v", statErr)
+	}
+}
+
+// The absolute resolved command must be what enters the session/new request, so
+// the MCP server is spawned from the validated binary regardless of spawn cwd.
+func TestSessionRequestUsesAbsoluteMcpCommand(t *testing.T) {
+	dir := t.TempDir()
+	acp := filepath.Join(dir, "acpmux")
+	mcp := filepath.Join(dir, "engram9-mcp")
+	for _, p := range []string{acp, mcp} {
+		if err := os.WriteFile(p, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b, err := NewACPBackend(t.TempDir(), ACPBackendConfig{
+		Provider: "claude", AcpmuxCommand: acp, Engram9McpCommand: "./engram9-mcp", // relative on purpose
+	})
+	// Resolve happens relative to cwd; run from dir so the relative path resolves.
+	if err != nil {
+		// Retry from dir if the relative path did not resolve from the test cwd.
+		orig, _ := os.Getwd()
+		_ = os.Chdir(dir)
+		b, err = NewACPBackend(t.TempDir(), ACPBackendConfig{
+			Provider: "claude", AcpmuxCommand: acp, Engram9McpCommand: "./engram9-mcp",
+		})
+		_ = os.Chdir(orig)
+	}
+	if err != nil {
+		t.Fatalf("backend construction failed: %v", err)
+	}
+	if !filepath.IsAbs(b.cfg.Engram9McpCommand) {
+		t.Fatalf("stored mcp command must be absolute; got %q", b.cfg.Engram9McpCommand)
+	}
+	req := newACPSessionRequestWithArgs("/tmp/staging", b.cfg.Engram9McpCommand, []string{"-mode", "agent"})
+	raw, _ := json.Marshal(req)
+	if !strings.Contains(string(raw), b.cfg.Engram9McpCommand) || !filepath.IsAbs(b.cfg.Engram9McpCommand) {
+		t.Fatalf("session/new must carry the absolute mcp command; got req=%s", string(raw))
 	}
 }

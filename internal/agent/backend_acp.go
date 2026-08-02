@@ -651,43 +651,37 @@ func acpmuxArgs(provider string, allowedTools []string) []string {
 // structurally removes pairing skew from an ambient/interactive PATH. An
 // absolute or relative path with a separator is honored verbatim (and checked
 // for existence + executability). Returns an error if nothing is resolvable.
+// The returned command is ALWAYS an absolute path so it resolves to the same
+// executable regardless of the process cwd. This matters because the command is
+// validated here (in engram9's cwd) but used later in session/new whose spawn
+// cwd is the per-turn staging dir: a relative path that verifies here could fail
+// (or resolve to a different binary) at spawn time, reopening the fail-open
+// "verified but no companion at spawn" window. exec.LookPath is used for the
+// real existence+executability check (its effective-permission semantics are
+// correct for this process, unlike a bare mode&0111 stat).
 func resolveEngram9McpCommand(cmd string) (string, error) {
-	// Explicit path (contains a separator): honor verbatim, verify it runs.
+	// Explicit path (contains a separator): honor it, but validate + absolutize.
 	if strings.ContainsRune(cmd, os.PathSeparator) {
-		if err := isExecutableFile(cmd); err != nil {
+		resolved, err := exec.LookPath(cmd)
+		if err != nil {
 			return "", err
 		}
-		return cmd, nil
+		return filepath.Abs(resolved)
 	}
-	// Prefer a sibling of the running executable.
+	// Prefer a sibling of the running executable (already an absolute dir).
 	if exe, err := os.Executable(); err == nil {
 		sibling := filepath.Join(filepath.Dir(exe), cmd)
-		if isExecutableFile(sibling) == nil {
-			return sibling, nil
+		if _, lookErr := exec.LookPath(sibling); lookErr == nil {
+			return filepath.Abs(sibling)
 		}
 	}
-	// Fall back to PATH.
+	// Fall back to PATH; absolutize because a relative PATH entry can yield a
+	// relative result.
 	resolved, err := exec.LookPath(cmd)
 	if err != nil {
 		return "", err
 	}
-	return resolved, nil
-}
-
-// isExecutableFile returns nil if path is an existing, non-directory,
-// owner-executable file.
-func isExecutableFile(path string) error {
-	info, err := os.Stat(path)
-	if err != nil {
-		return err
-	}
-	if info.IsDir() {
-		return fmt.Errorf("%s is a directory, not an executable", path)
-	}
-	if info.Mode()&0o111 == 0 {
-		return fmt.Errorf("%s is not executable", path)
-	}
-	return nil
+	return filepath.Abs(resolved)
 }
 
 func newACPSessionRequest(stagingDir, mcpCommand string) acpRequest {
