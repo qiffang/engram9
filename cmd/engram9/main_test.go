@@ -87,3 +87,14 @@ func runCLIGit(t *testing.T, root string, args ...string) {
 		t.Fatalf("git %v: %v\n%s", args, err, out)
 	}
 }
+
+func TestEngram9McpCommandFromEnv(t *testing.T) {
+	t.Setenv("ENGRAM9_MCP_COMMAND", "")
+	if got := engram9McpCommandFromEnv(); got != "engram9-mcp" {
+		t.Fatalf("unset ENGRAM9_MCP_COMMAND must default to engram9-mcp; got %q", got)
+	}
+	t.Setenv("ENGRAM9_MCP_COMMAND", "/opt/engram9/engram9-mcp")
+	if got := engram9McpCommandFromEnv(); got != "/opt/engram9/engram9-mcp" {
+		t.Fatalf("explicit ENGRAM9_MCP_COMMAND must be honored; got %q", got)
+	}
+}

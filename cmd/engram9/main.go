@@ -136,6 +136,11 @@ func runServe(args []string) {
 		if acpmuxCmd == "" {
 			acpmuxCmd = "acpmux"
 		}
+		// ENGRAM9_MCP_COMMAND lets operators point at an explicit engram9-mcp
+		// companion path (symmetric with ACPMUX_COMMAND). This is the actionable
+		// knob named by the fail-closed error when the companion is not found on
+		// PATH / beside the executable. Empty ⇒ default resolution ("engram9-mcp").
+		engram9McpCmd := engram9McpCommandFromEnv()
 		turnTimeout := agent.DefaultACPTurnTimeout
 		if raw := os.Getenv("ACP_TURN_TIMEOUT"); raw != "" {
 			if secs, err := strconv.Atoi(raw); err == nil && secs > 0 {
@@ -149,11 +154,12 @@ func runServe(args []string) {
 			}
 		}
 		acpCfg = &agent.ACPBackendConfig{
-			Provider:       acpProvider,
-			AcpmuxCommand:  acpmuxCmd,
-			TurnTimeout:    turnTimeout,
-			MaxDiffBytes:   maxDiffBytes,
-			AdditionalDirs: os.Getenv("ACP_ADDITIONAL_DIRS"),
+			Provider:          acpProvider,
+			AcpmuxCommand:     acpmuxCmd,
+			Engram9McpCommand: engram9McpCmd,
+			TurnTimeout:       turnTimeout,
+			MaxDiffBytes:      maxDiffBytes,
+			AdditionalDirs:    os.Getenv("ACP_ADDITIONAL_DIRS"),
 		}
 		log.Printf("ACP backend (provider: %s, acpmux: %s, turn_timeout: %s) — ingest=%s compile=%s query=%s", acpProvider, acpmuxCmd, turnTimeout, wikiBackend, compileBackend, queryBackend)
 	}
@@ -361,4 +367,15 @@ func runRepoScan(args []string) int {
 		fmt.Fprintf(os.Stdout, "repo scan wrote %d fact(s), %d file(s): %s\n", len(bundle.Facts), len(bundle.Manifest.Files), *outDir)
 	}
 	return 0
+}
+
+// engram9McpCommandFromEnv returns the engram9-mcp companion command from
+// ENGRAM9_MCP_COMMAND, defaulting to "engram9-mcp" when unset. Symmetric with
+// ACPMUX_COMMAND; this is the operator knob named by the fail-closed
+// "companion not found" error.
+func engram9McpCommandFromEnv() string {
+	if cmd := os.Getenv("ENGRAM9_MCP_COMMAND"); cmd != "" {
+		return cmd
+	}
+	return "engram9-mcp"
 }

@@ -64,7 +64,7 @@ func newACPTestHandler(t *testing.T, dataDir string) *Handler {
 		WikiBackend:  "acp",
 		QueryBackend: "llm",
 		ACPConfig: &agent.ACPBackendConfig{
-			Provider: "claude", AcpmuxCommand: scriptPath, TurnTimeout: time.Second,
+			Provider: "claude", AcpmuxCommand: scriptPath, Engram9McpCommand: scriptPath, TurnTimeout: time.Second,
 		},
 	})
 	require.NoError(t, err)
@@ -240,7 +240,7 @@ printf '%%s\n' '{"jsonrpc":"2.0","id":3,"result":{"text":"processed"}}'
 		WikiBackend:  "acp",
 		QueryBackend: "llm",
 		ACPConfig: &agent.ACPBackendConfig{
-			Provider: "claude", AcpmuxCommand: scriptPath, TurnTimeout: time.Second,
+			Provider: "claude", AcpmuxCommand: scriptPath, Engram9McpCommand: scriptPath, TurnTimeout: time.Second,
 		},
 		CoordinatorConfig: agent.CoordinatorConfig{FlushThreshold: 1, FlushInterval: time.Hour},
 	})
@@ -881,7 +881,7 @@ func TestNewWithOptionsAllACPNoLLMClient(t *testing.T) {
 		CompileBackend: "acp",
 		QueryBackend:   "acp",
 		ACPConfig: &agent.ACPBackendConfig{
-			Provider: "claude", AcpmuxCommand: scriptPath, TurnTimeout: time.Second,
+			Provider: "claude", AcpmuxCommand: scriptPath, Engram9McpCommand: scriptPath, TurnTimeout: time.Second,
 		},
 	})
 	require.NoError(t, err)
@@ -908,7 +908,7 @@ func TestNewWithOptionsDefaultsToACP(t *testing.T) {
 	require.NoError(t, os.WriteFile(scriptPath, []byte("#!/bin/sh\nexit 0\n"), 0o755))
 	h, err := NewWithOptions(t.TempDir(), nil, Options{
 		ACPConfig: &agent.ACPBackendConfig{
-			Provider: "claude", AcpmuxCommand: scriptPath, TurnTimeout: time.Second,
+			Provider: "claude", AcpmuxCommand: scriptPath, Engram9McpCommand: scriptPath, TurnTimeout: time.Second,
 		},
 	})
 	require.NoError(t, err)

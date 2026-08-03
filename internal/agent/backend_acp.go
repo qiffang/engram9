@@ -23,11 +23,12 @@ const (
 
 // ACPBackendConfig holds configuration for the ACP backend.
 type ACPBackendConfig struct {
-	Provider       string        // "claude" (Phase 1; codex pending MCP injection support)
-	AcpmuxCommand  string        // path to acpmux binary (default: "acpmux")
-	TurnTimeout    time.Duration // per-turn timeout (default: 10m)
-	MaxDiffBytes   int64         // max bytes changed per turn (default: 1MB)
-	AdditionalDirs string        // rejected if set (Phase 1)
+	Provider          string        // "claude" (Phase 1; codex pending MCP injection support)
+	AcpmuxCommand     string        // path to acpmux binary (default: "acpmux")
+	Engram9McpCommand string        // path to engram9-mcp companion (default: "engram9-mcp")
+	TurnTimeout       time.Duration // per-turn timeout (default: 10m)
+	MaxDiffBytes      int64         // max bytes changed per turn (default: 1MB)
+	AdditionalDirs    string        // rejected if set (Phase 1)
 }
 
 // ACPBackend runs wiki agents via acpmux ACP protocol.
@@ -112,6 +113,24 @@ func NewACPBackend(dataDir string, cfg ACPBackendConfig) (*ACPBackend, error) {
 	if _, err := exec.LookPath(cfg.AcpmuxCommand); err != nil {
 		return nil, fmt.Errorf("acpmux binary not found: %w", err)
 	}
+
+	// Verify the engram9-mcp companion binary is resolvable (task #66 root 1).
+	// The wiki tools (read_wiki_index, write_wiki_page, ...) are provided by the
+	// engram9-mcp MCP server; if it is missing, session/new silently starts the
+	// agent with only built-in Glob/Grep and every wiki batch fails "no
+	// write-capable tool". This must fail CLOSED at init — symmetric with the
+	// acpmux check above — never fail open into a tool-less improvising session.
+	if cfg.Engram9McpCommand == "" {
+		cfg.Engram9McpCommand = "engram9-mcp"
+	}
+	resolvedMcp, err := resolveEngram9McpCommand(cfg.Engram9McpCommand)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"engram9-mcp companion binary not found (%q): %w; engram9 and engram9-mcp are a same-head version pair — install both from the same build into the same directory, or set Engram9McpCommand to an explicit path",
+			cfg.Engram9McpCommand, err,
+		)
+	}
+	cfg.Engram9McpCommand = resolvedMcp
 
 	maxDiff := cfg.MaxDiffBytes
 	if maxDiff <= 0 {
@@ -351,7 +370,7 @@ func (b *ACPBackend) runACPTurnFullOpts(ctx context.Context, prompt string, valO
 	if opts.mcpArgs != nil {
 		mcpArgs = opts.mcpArgs(stagingDir)
 	}
-	sessionReq := newACPSessionRequestWithArgs(stagingDir, mcpArgs)
+	sessionReq := newACPSessionRequestWithArgs(stagingDir, b.cfg.Engram9McpCommand, mcpArgs)
 	if err := sendACPRequest(stdin, sessionReq); err != nil {
 		return TurnResult{}, fmt.Errorf("send session/new: %w", err)
 	}
@@ -428,7 +447,7 @@ func (b *ACPBackend) runACPTurnFullOpts(ctx context.Context, prompt string, valO
 		// Otherwise it's a notification/update — accumulate agent message text.
 		if resp.Method != "" {
 			if text := agentMessageChunkText(resp.Params); text != "" {
-				chunks.WriteString(text)
+				appendAgentMessageChunk(&chunks, text)
 			}
 			if os.Getenv("ENGRAM9_ACP_DEBUG") != "" {
 				log.Printf("[acp-debug] %s params=%s", resp.Method, string(resp.Params))
@@ -547,6 +566,34 @@ func agentMessageChunkText(params json.RawMessage) string {
 	return p.Update.Content.Text
 }
 
+// appendAgentMessageChunk accumulates one non-empty agent_message_chunk into the
+// turn summary (task #66 root 2). It inserts a newline BEFORE every chunk after
+// the first so that a chunk beginning a new logical line — e.g. an
+// `EVENT <id> INTEGRATED ...` verdict line emitted right after a prose block —
+// is not concatenated onto the previous line. Without the separator, the strict
+// anchored verdict parser (^EVENT ...) correctly rejects the run-together line,
+// producing a spurious no_per_event_verdict even though the verdict is present.
+//
+// A separator-PER-CHUNK is correct ONLY BECAUSE the acpmux Claude adapter
+// contract emits complete content[type=text] blocks as chunks and does NOT
+// enable --include-partial-messages, so a chunk boundary never falls inside a
+// single logical line. If a future acpmux change enables partial-message
+// streaming (grep --include-partial-messages), this assumption is invalidated
+// and this accumulator MUST be reworked to be message/content-block-boundary
+// aware (aggregate deltas within a message, separate only at message boundaries).
+//
+// The caller must pass only non-empty text; empty chunks are skipped upstream so
+// no phantom separator is produced.
+func appendAgentMessageChunk(chunks *strings.Builder, text string) {
+	if text == "" {
+		return
+	}
+	if chunks.Len() > 0 {
+		chunks.WriteByte('\n')
+	}
+	chunks.WriteString(text)
+}
+
 // engram9 MCP tool names, prefixed as the Claude adapter exposes injected MCP
 // tools (mcp__<server>__<tool>). The --allowedTools whitelist below is the
 // runtime capability boundary: a tool the mode needs but omits here is simply
@@ -596,14 +643,56 @@ func acpmuxArgs(provider string, allowedTools []string) []string {
 	}
 }
 
-func newACPSessionRequest(stagingDir string) acpRequest {
-	return newACPSessionRequestWithArgs(stagingDir, []string{"-data", stagingDir, "-mode", "agent"})
+// resolveEngram9McpCommand resolves the engram9-mcp companion binary (task #66
+// root 1 / paired-deployment contract). engram9 and engram9-mcp are a same-head
+// version pair, so resolution prefers a binary that lives beside the running
+// engram9 executable (os.Executable() sibling) before falling back to PATH.
+// This makes a correct deployment "install both files into one directory" and
+// structurally removes pairing skew from an ambient/interactive PATH. An
+// absolute or relative path with a separator is validated (existence +
+// executability) and returned as an absolute path — the input string is NOT
+// used as-is. Returns an error if nothing is resolvable.
+// The returned command is ALWAYS an absolute path so it resolves to the same
+// executable regardless of the process cwd. This matters because the command is
+// validated here (in engram9's cwd) but used later in session/new whose spawn
+// cwd is the per-turn staging dir: a relative path that verifies here could fail
+// (or resolve to a different binary) at spawn time, reopening the fail-open
+// "verified but no companion at spawn" window. exec.LookPath is used for the
+// real existence+executability check (its effective-permission semantics are
+// correct for this process, unlike a bare mode&0111 stat).
+func resolveEngram9McpCommand(cmd string) (string, error) {
+	// Explicit path (contains a separator): honor it, but validate + absolutize.
+	if strings.ContainsRune(cmd, os.PathSeparator) {
+		resolved, err := exec.LookPath(cmd)
+		if err != nil {
+			return "", err
+		}
+		return filepath.Abs(resolved)
+	}
+	// Prefer a sibling of the running executable (already an absolute dir).
+	if exe, err := os.Executable(); err == nil {
+		sibling := filepath.Join(filepath.Dir(exe), cmd)
+		if _, lookErr := exec.LookPath(sibling); lookErr == nil {
+			return filepath.Abs(sibling)
+		}
+	}
+	// Fall back to PATH; absolutize because a relative PATH entry can yield a
+	// relative result.
+	resolved, err := exec.LookPath(cmd)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Abs(resolved)
+}
+
+func newACPSessionRequest(stagingDir, mcpCommand string) acpRequest {
+	return newACPSessionRequestWithArgs(stagingDir, mcpCommand, []string{"-data", stagingDir, "-mode", "agent"})
 }
 
 // newACPSessionRequestWithArgs builds a session/new request whose engram9 MCP
 // server is launched with the given args. Compile and query modes pass their
 // mode plus (for compile) -turn-id/-event-bound/-receipt here.
-func newACPSessionRequestWithArgs(stagingDir string, mcpArgs []string) acpRequest {
+func newACPSessionRequestWithArgs(stagingDir, mcpCommand string, mcpArgs []string) acpRequest {
 	return acpRequest{
 		JSONRPC: "2.0",
 		ID:      json.RawMessage(`2`),
@@ -614,7 +703,7 @@ func newACPSessionRequestWithArgs(stagingDir string, mcpArgs []string) acpReques
 				{
 					"name":    "engram9",
 					"type":    "stdio",
-					"command": "engram9-mcp",
+					"command": mcpCommand,
 					"args":    mcpArgs,
 				},
 			},
