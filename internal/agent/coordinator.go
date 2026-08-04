@@ -168,8 +168,18 @@ type CoordinatorStatus struct {
 	LastError          *BatchError         `json:"last_error"`
 	UnknownByReason    map[string]int      `json:"unknown_by_reason,omitempty"`
 	UnknownStreak      *UnknownStreakStop  `json:"unknown_streak,omitempty"`
-	Suspended          bool                `json:"-"`
-	EventsRemaining    int                 `json:"-"`
+	// Batch capacity limits (the source of truth for how large a single
+	// ingested event may be). A producer of events (e.g. autopilot's wiki
+	// ingest) must size each event well below MaxTokensPerBatch so that
+	// multiple events pack into one batch; a single event larger than the
+	// batch token limit monopolizes its batch (task #38 / wiki 1-event-per-batch
+	// slowdown). Exposed so producers derive their per-event budget from this
+	// single source instead of hard-coding an independent constant.
+	MaxTokensPerBatch int  `json:"max_tokens_per_batch"`
+	MaxEventsPerBatch int  `json:"max_events_per_batch"`
+	MaxBytesPerBatch  int  `json:"max_bytes_per_batch"`
+	Suspended         bool `json:"-"`
+	EventsRemaining   int  `json:"-"`
 }
 
 type AdminResult struct {
@@ -948,6 +958,9 @@ func (coordinator *BatchCoordinator) Status() CoordinatorStatus {
 		ActionableFailures: counts.Failed + counts.Unknown, DeferredEvents: len(deferredIDs), DeferredIDs: deferredIDs,
 		IndexStale: coordinator.indexStale, CurrentBatch: currentBatch, Suspended: coordinator.suspended,
 		UnknownByReason: coordinator.store.UnknownByReason(), UnknownStreak: coordinator.unknownStreakStop,
+		MaxTokensPerBatch: coordinator.limits.MaxTokensPerBatch,
+		MaxEventsPerBatch: coordinator.limits.MaxEventsPerBatch,
+		MaxBytesPerBatch:  coordinator.limits.MaxBytesPerBatch,
 	}
 	if coordinator.lastResult != nil {
 		status.StatusWriteErrors = coordinator.lastResult.StatusWriteErrors

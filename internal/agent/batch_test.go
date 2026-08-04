@@ -170,6 +170,42 @@ func TestParseEventResults(t *testing.T) {
 	}, got)
 }
 
+// task #38 (PR-A): once producers size each event under DefaultMaxTokensPerBatch/k,
+// FormBatches actually packs >=k events into ONE batch — previously (24k events >
+// 12k cap) every batch held exactly one event, which masked the multi-event
+// verdict path. This asserts both halves: >=4 same-size events pack into one
+// batch at the real default limits, AND each gets its own distinct verdict with
+// no cross-talk or loss.
+func TestFormBatchesPacksMultipleEventsAndEachGetsOwnVerdict(t *testing.T) {
+	// FormBatches estimates tokens as bytes/4. Size each event at ~cap/5 tokens
+	// so >=5 fit under the default token cap (and comfortably >=4).
+	perEventChars := DefaultMaxTokensPerBatch / 5 * 4
+	events := []PendingEvent{
+		{ID: "e1", Text: strings.Repeat("a", perEventChars)},
+		{ID: "e2", Text: strings.Repeat("b", perEventChars)},
+		{ID: "e3", Text: strings.Repeat("c", perEventChars)},
+		{ID: "e4", Text: strings.Repeat("d", perEventChars)},
+	}
+	batches := FormBatches(events, DefaultBatchLimits)
+	require.Len(t, batches, 1, "4 events sized at cap/5 must pack into ONE batch (not 1-per-batch)")
+	require.Len(t, batches[0].Events, 4)
+
+	// Each event gets its own distinct verdict — no cross-talk, none lost.
+	summary := strings.Join([]string{
+		"EVENT e1 INTEGRATED pages: semantic/e1.md",
+		"EVENT e2 SKIPPED reason: duplicate",
+		"EVENT e3 FAILED reason: cannot classify",
+		"EVENT e4 INTEGRATED pages: semantic/e4.md",
+	}, "\n")
+	got := parseEventResults(batches[0], summary, "transcripts/test.log")
+	require.Equal(t, []EventResult{
+		{EventID: "e1", Status: "integrated", Pages: []string{"semantic/e1.md"}},
+		{EventID: "e2", Status: "skipped", Reason: "duplicate"},
+		{EventID: "e3", Status: "failed_by_agent", Reason: "cannot classify"},
+		{EventID: "e4", Status: "integrated", Pages: []string{"semantic/e4.md"}},
+	}, got)
+}
+
 func TestParseEventResultsUnknownReasons(t *testing.T) {
 	batch := makeBatch([]PendingEvent{{ID: "a"}, {ID: "b"}}, 0)
 
