@@ -473,6 +473,20 @@ func TestBatchCoordinatorStatusPopulatesFrozenFailureFields(t *testing.T) {
 	require.False(t, status.LastError.Timestamp.IsZero())
 }
 
+// task #38: the coordinator's batch capacity is the single source of truth an
+// event producer (autopilot wiki ingest) must derive its per-event budget from.
+// Status() must surface it so producers don't hard-code an independent constant.
+func TestBatchCoordinatorStatusExposesBatchLimits(t *testing.T) {
+	store := newFakeCoordinatorStore(PendingEvent{ID: "a"})
+	coordinator := newTestCoordinator(t, store, &fakeBatchBackend{run: successfulBatchResult}, CoordinatorConfig{})
+
+	status := coordinator.Status()
+	require.Equal(t, DefaultMaxTokensPerBatch, status.MaxTokensPerBatch)
+	require.Equal(t, DefaultMaxEventsPerBatch, status.MaxEventsPerBatch)
+	require.Equal(t, DefaultMaxBytesPerBatch, status.MaxBytesPerBatch)
+	require.Greater(t, status.MaxTokensPerBatch, 0, "producers divide by this; must be positive")
+}
+
 func TestBatchCoordinatorCountsEachStatusWriteFailure(t *testing.T) {
 	events := makePendingEvents(20)
 	store := newFakeCoordinatorStore(events...)

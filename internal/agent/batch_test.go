@@ -170,6 +170,95 @@ func TestParseEventResults(t *testing.T) {
 	}, got)
 }
 
+// task #38 (PR-A): once producers size each event under DefaultMaxTokensPerBatch/k,
+// FormBatches actually packs >=k events into ONE batch — previously (24k events >
+// 12k cap) every batch held exactly one event, which masked the multi-event
+// verdict path. This asserts both halves: >=4 same-size events pack into one
+// batch at the real default limits, AND each gets its own distinct verdict with
+// no cross-talk or loss.
+func TestFormBatchesPacksMultipleEventsAndEachGetsOwnVerdict(t *testing.T) {
+	// FormBatches estimates tokens as bytes/4. Size each event at ~cap/5 tokens
+	// so >=5 fit under the default token cap (and comfortably >=4).
+	perEventChars := DefaultMaxTokensPerBatch / 5 * 4
+	events := []PendingEvent{
+		{ID: "e1", Text: strings.Repeat("a", perEventChars)},
+		{ID: "e2", Text: strings.Repeat("b", perEventChars)},
+		{ID: "e3", Text: strings.Repeat("c", perEventChars)},
+		{ID: "e4", Text: strings.Repeat("d", perEventChars)},
+	}
+	batches := FormBatches(events, DefaultBatchLimits)
+	require.Len(t, batches, 1, "4 events sized at cap/5 must pack into ONE batch (not 1-per-batch)")
+	require.Len(t, batches[0].Events, 4)
+
+	// Each event gets its own distinct verdict — no cross-talk, none lost.
+	summary := strings.Join([]string{
+		"EVENT e1 INTEGRATED pages: semantic/e1.md",
+		"EVENT e2 SKIPPED reason: duplicate",
+		"EVENT e3 FAILED reason: cannot classify",
+		"EVENT e4 INTEGRATED pages: semantic/e4.md",
+	}, "\n")
+	got := parseEventResults(batches[0], summary, "transcripts/test.log")
+	require.Equal(t, []EventResult{
+		{EventID: "e1", Status: "integrated", Pages: []string{"semantic/e1.md"}},
+		{EventID: "e2", Status: "skipped", Reason: "duplicate"},
+		{EventID: "e3", Status: "failed_by_agent", Reason: "cannot classify"},
+		{EventID: "e4", Status: "integrated", Pages: []string{"semantic/e4.md"}},
+	}, got)
+}
+
+// task #38 (PR-A, adversary-1 blocker #1): FormBatches sizes each event as
+// text + serialized context (EventByteSize), so an autopilot budget that reserves
+// only the TEXT at capacity/k leaves no room for context and k near-limit events
+// overflow the batch. This asserts the contract the autopilot reserve must honor:
+// events whose TEXT is (cap/k - contextTokens) each, PLUS a realistic /remember
+// context, still pack k into ONE batch under DefaultBatchLimits.
+func TestFourNearLimitEventsWithContextPackIntoOneBatch(t *testing.T) {
+	// Mirror the /remember context autopilot sends (see wiki.py _remember_context).
+	ctx := map[string]string{
+		"actor":          "drive9-autopilot",
+		"source":         "repo_scan",
+		"active_project": "qiffang/drive9",
+		"active_task":    "pkg/fuse",
+	}
+	contextBytes := len(serializeContext(ctx))
+	k := 4
+	perEventTokens := DefaultMaxTokensPerBatch / k
+	// Autopilot reserves the context cost (bytes/4) PLUS a safety margin from the
+	// per-event text budget — mirrors wiki.py _ingest_context_overhead_tokens
+	// (contextBytes/4 + WIKI_INGEST_CONTEXT_SAFETY_TOKENS=64). The margin is what
+	// keeps text+context under BOTH the token and byte caps (48000 = 12000*4, so
+	// the byte cap binds without it).
+	const contextSafetyTokens = 64
+	textBudgetTokens := perEventTokens - (contextBytes/4 + contextSafetyTokens)
+	textBytes := textBudgetTokens * 4 // FormBatches estimates tokens as bytes/4
+
+	events := make([]PendingEvent, k)
+	for i := 0; i < k; i++ {
+		events[i] = PendingEvent{
+			ID:      "e" + string(rune('1'+i)),
+			Text:    strings.Repeat("x", textBytes),
+			Context: ctx,
+		}
+	}
+	batches := FormBatches(events, DefaultBatchLimits)
+	require.Len(t, batches, 1,
+		"4 events whose text reserves the context overhead must pack into ONE batch")
+	require.Len(t, batches[0].Events, k)
+
+	// And prove the reserve is load-bearing: without it (text = full cap/k), the
+	// same 4 events plus context DO overflow into more than one batch.
+	unreserved := make([]PendingEvent, k)
+	for i := 0; i < k; i++ {
+		unreserved[i] = PendingEvent{
+			ID:      "u" + string(rune('1'+i)),
+			Text:    strings.Repeat("x", perEventTokens*4),
+			Context: ctx,
+		}
+	}
+	require.Greater(t, len(FormBatches(unreserved, DefaultBatchLimits)), 1,
+		"sanity: without the context reserve, 4 cap/k-text events + context must NOT fit one batch")
+}
+
 func TestParseEventResultsUnknownReasons(t *testing.T) {
 	batch := makeBatch([]PendingEvent{{ID: "a"}, {ID: "b"}}, 0)
 
