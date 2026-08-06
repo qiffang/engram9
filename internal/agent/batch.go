@@ -60,6 +60,7 @@ type EventResult struct {
 // Closed reason enum for "unknown" outcomes. Classification failure maps to
 // UnknownReasonUnclassified — an empty reason is structurally impossible.
 const (
+	UnknownReasonAuthExpired        = "auth_expired"               // provider OAuth token expired during the turn
 	UnknownReasonNoPerEventVerdict  = "no_per_event_verdict"       // agent output has verdict lines, none for this event
 	UnknownReasonMalformedVerdict   = "malformed_verdict"          // verdict lines present but none match batch event IDs
 	UnknownReasonTurnEndedNoOutput  = "turn_ended_no_output"       // agent turn completed with empty output
@@ -73,7 +74,7 @@ const (
 // UnknownReasonUnclassified at its write AND read boundaries.
 func IsValidUnknownReason(reason string) bool {
 	switch reason {
-	case UnknownReasonNoPerEventVerdict, UnknownReasonMalformedVerdict,
+	case UnknownReasonAuthExpired, UnknownReasonNoPerEventVerdict, UnknownReasonMalformedVerdict,
 		UnknownReasonTurnEndedNoOutput, UnknownReasonParserError,
 		UnknownReasonRecoveredFromCrash, UnknownReasonUnclassified:
 		return true
@@ -277,7 +278,9 @@ func parseEventResults(batch Batch, summary string, transcriptPath string) []Eve
 	}
 
 	defaultReason := UnknownReasonNoPerEventVerdict
-	if strings.TrimSpace(summary) == "" {
+	if providerAuthenticationExpired(summary) {
+		defaultReason = UnknownReasonAuthExpired
+	} else if strings.TrimSpace(summary) == "" {
 		defaultReason = UnknownReasonTurnEndedNoOutput
 	} else if validEventLines > 0 && len(parsed) == 0 {
 		defaultReason = UnknownReasonMalformedVerdict
@@ -298,6 +301,22 @@ func parseEventResults(batch Batch, summary string, transcriptPath string) []Eve
 		results = append(results, result)
 	}
 	return results
+}
+
+// providerAuthenticationExpired recognizes the terminal Claude Code failure
+// shape observed in production. It intentionally requires all three signals
+// (HTTP 401, authentication failure, and an expired/re-authenticate marker) so
+// an event whose prose merely discusses OAuth does not get misclassified.
+func providerAuthenticationExpired(summary string) bool {
+	normalized := strings.ToLower(summary)
+	if !strings.Contains(normalized, "api error: 401") {
+		return false
+	}
+	authFailure := strings.Contains(normalized, "failed to authenticate") ||
+		strings.Contains(normalized, "authentication_error")
+	expired := strings.Contains(normalized, "oauth access token has expired") ||
+		strings.Contains(normalized, "re-authenticate to continue")
+	return authFailure && expired
 }
 
 func parseEventResultLine(eventID, status, tail string) (EventResult, bool) {

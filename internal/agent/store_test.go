@@ -386,15 +386,16 @@ func TestPendingEventStoreUnknownByReason(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, store.WriteStatuses([]StatusEntry{
 		{EventID: "ev-a", Status: "unknown", Reason: UnknownReasonNoPerEventVerdict, TranscriptPath: "transcripts/b1.log"},
-		{EventID: "ev-b", Status: "unknown", Reason: UnknownReasonNoPerEventVerdict, TranscriptPath: "transcripts/b1.log"},
+		{EventID: "ev-b", Status: "unknown", Reason: UnknownReasonAuthExpired, TranscriptPath: "transcripts/auth.log"},
 		{EventID: "ev-c", Status: "unknown"}, // legacy empty reason
 		{EventID: "ev-d", Status: "integrated"},
 	}))
 
 	counts := store.UnknownByReason()
-	require.Equal(t, 2, counts[UnknownReasonNoPerEventVerdict])
+	require.Equal(t, 1, counts[UnknownReasonNoPerEventVerdict])
+	require.Equal(t, 1, counts[UnknownReasonAuthExpired])
 	require.Equal(t, 1, counts[UnknownReasonUnclassified], "legacy empty reason must group under unclassified")
-	require.Len(t, counts, 2, "integrated events must not appear")
+	require.Len(t, counts, 3, "integrated events must not appear")
 
 	status := mustEventStatus(t, store, "ev-a")
 	require.Equal(t, "transcripts/b1.log", status.TranscriptPath, "transcript path must round-trip through the store")

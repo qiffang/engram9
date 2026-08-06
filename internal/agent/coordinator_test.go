@@ -714,6 +714,64 @@ func TestUnknownStreakSuspendsFlush(t *testing.T) {
 	require.Equal(t, StopReasonUnknownStreak, status.LastError.ErrorClass)
 }
 
+func TestAuthExpiredStopsAfterFirstBatchWithExplicitEvidence(t *testing.T) {
+	store := newFakeCoordinatorStore(makePendingEvents(8)...)
+	backend := &fakeBatchBackend{run: func(_ context.Context, batch Batch) (BatchResult, error) {
+		results := make([]EventResult, len(batch.Events))
+		for index, event := range batch.Events {
+			results[index] = EventResult{
+				EventID: event.ID, Status: "unknown", Reason: UnknownReasonAuthExpired,
+				TranscriptPath: "transcripts/" + batch.ID + ".log",
+			}
+		}
+		return BatchResult{BatchID: batch.ID, Status: "success", EventResults: results}, nil
+	}}
+	coordinator := newTestCoordinator(t, store, backend, CoordinatorConfig{})
+	coordinator.limits.MaxEventsPerBatch = 4
+
+	result := coordinator.flush(flushExplicit)
+
+	require.Equal(t, StopReasonAuthExpired, result.StoppedReason)
+	require.Len(t, backend.calls, 1, "expired credentials must stop before another provider turn")
+	require.Equal(t, 4, result.EventsUnknown)
+	status := coordinator.Status()
+	require.True(t, status.Suspended)
+	require.Equal(t, "suspended", status.Health)
+	require.Nil(t, status.UnknownStreak, "an auth failure is not an ordinary unknown streak")
+	require.NotNil(t, status.ProviderAuth)
+	require.Equal(t, UnknownReasonAuthExpired, status.ProviderAuth.Reason)
+	require.Equal(t, []string{"transcripts/" + backend.calls[0].ID + ".log"}, status.ProviderAuth.TranscriptPaths)
+	require.Equal(t, 4, status.UnknownByReason[UnknownReasonAuthExpired])
+	require.NotNil(t, status.LastError)
+	require.Equal(t, StopReasonAuthExpired, status.LastError.ErrorClass)
+	require.Contains(t, status.LastError.Message, "re-authenticate")
+
+	coordinator.NotifyNewEvent("event-probe")
+	status = coordinator.Status()
+	require.False(t, status.Suspended)
+	require.Nil(t, status.ProviderAuth, "an explicit recovery action must clear stale auth evidence")
+}
+
+func TestAuthExpiredTakesPriorityOverPartialAdjudication(t *testing.T) {
+	store := newFakeCoordinatorStore(makePendingEvents(4)...)
+	backend := &fakeBatchBackend{run: func(_ context.Context, batch Batch) (BatchResult, error) {
+		return BatchResult{BatchID: batch.ID, Status: "success", EventResults: []EventResult{
+			{EventID: batch.Events[0].ID, Status: "integrated", Pages: []string{"semantic/a.md"}},
+			{EventID: batch.Events[1].ID, Status: "integrated", Pages: []string{"semantic/b.md"}},
+			{EventID: batch.Events[2].ID, Status: "integrated", Pages: []string{"semantic/c.md"}},
+			{EventID: batch.Events[3].ID, Status: "unknown", Reason: UnknownReasonAuthExpired, TranscriptPath: "transcripts/auth.log"},
+		}}, nil
+	}}
+	coordinator := newTestCoordinator(t, store, backend, CoordinatorConfig{})
+
+	result := coordinator.flush(flushExplicit)
+
+	require.Equal(t, StopReasonAuthExpired, result.StoppedReason)
+	require.Equal(t, 3, result.EventsIntegrated)
+	require.Equal(t, 1, result.EventsUnknown)
+	require.True(t, coordinator.Status().Suspended)
+}
+
 func TestUnknownStreakResetsOnAdjudicatedOutcome(t *testing.T) {
 	// 5 single-event batches; batch 3 integrates. Streak: 1,2,reset,1,2 —
 	// never reaches the limit, so the flush must run to completion.
@@ -870,7 +928,7 @@ func TestFlushStopReasonsDocumented(t *testing.T) {
 	comment := text[commentStart : commentStart+commentEnd]
 	for _, reason := range []string{
 		StopReasonEnvelopeTimeout, StopReasonStopped, StopReasonInternalErrorLimit,
-		StopReasonStoreError, StopReasonUnknownStreak,
+		StopReasonStoreError, StopReasonUnknownStreak, StopReasonAuthExpired,
 	} {
 		require.Contains(t, comment, "\""+reason+"\"", "stop reason %q missing from doc comment", reason)
 	}
