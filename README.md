@@ -175,6 +175,12 @@ single batch coordinator. The coordinator groups up to 20 events, validates and
 merges each batch atomically, persists per-event integration status, and exposes
 its queue and health under `/status.batch_ingest`.
 
+If the provider reports an expired OAuth access token, the coordinator marks
+only the missing per-event verdicts as `auth_expired`, suspends before starting
+another provider batch, and exposes transcript evidence under `provider_auth`.
+Re-authenticate before explicitly resetting an unknown event; unknown outcomes
+are never retried automatically.
+
 The first ACP startup with an existing raw event log requires
 `BATCH_INGEST_EPOCH` in RFC3339 form. Events older than that one-time boundary
 are marked integrated; equal or newer events remain pending. Use

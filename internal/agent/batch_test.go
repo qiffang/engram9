@@ -267,6 +267,42 @@ func TestParseEventResultsUnknownReasons(t *testing.T) {
 	require.Equal(t, UnknownReasonNoPerEventVerdict, parseEventResults(batch, "unstructured summary", "transcripts/test.log")[0].Reason)
 }
 
+func TestParseEventResultsClassifiesObservedOAuthExpiry(t *testing.T) {
+	batch := makeBatch([]PendingEvent{{ID: "a"}, {ID: "b"}, {ID: "c"}, {ID: "d"}}, 0)
+	summary := `I'll process this batch of 4 events.
+Let me write these pages.
+Failed to authenticate. API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"OAuth access token has expired. Re-authenticate to continue."}}`
+
+	results := parseEventResults(batch, summary, "transcripts/observed.log")
+	require.Len(t, results, 4)
+	for _, result := range results {
+		require.Equal(t, "unknown", result.Status)
+		require.Equal(t, UnknownReasonAuthExpired, result.Reason)
+		require.Equal(t, "transcripts/observed.log", result.TranscriptPath)
+	}
+
+	partial := parseEventResults(batch, "EVENT a INTEGRATED pages: semantic/a.md\n"+summary, "transcripts/partial.log")
+	require.Equal(t, "integrated", partial[0].Status)
+	for _, result := range partial[1:] {
+		require.Equal(t, "unknown", result.Status)
+		require.Equal(t, UnknownReasonAuthExpired, result.Reason)
+	}
+}
+
+func TestProviderAuthenticationExpiredRequiresCompleteSignature(t *testing.T) {
+	require.True(t, providerAuthenticationExpired(
+		`Failed to authenticate. API Error: 401 {"error":{"type":"authentication_error","message":"OAuth access token has expired. Re-authenticate to continue."}}`,
+	))
+	for _, summary := range []string{
+		"API Error: 401",
+		"Failed to authenticate: API Error: 500",
+		"Event text discusses an OAuth access token that has expired",
+		"authentication_error: re-authenticate to continue",
+	} {
+		require.False(t, providerAuthenticationExpired(summary), summary)
+	}
+}
+
 func TestMakeBatchRecomputesRetryMetadata(t *testing.T) {
 	events := []PendingEvent{{ID: "b", Text: "1234"}, {ID: "a", Text: "5678"}}
 	got := makeBatch(events, 2)

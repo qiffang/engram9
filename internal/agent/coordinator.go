@@ -82,13 +82,14 @@ type BatchError struct {
 // when the flush ran to completion). TestFlushStopReasonsDocumented asserts
 // this comment stays in sync with the constants below:
 // "envelope_timeout", "stopped", "internal_error_limit", "store_error",
-// "unknown_streak".
+// "unknown_streak", "auth_expired".
 const (
 	StopReasonEnvelopeTimeout    = "envelope_timeout"
 	StopReasonStopped            = "stopped"
 	StopReasonInternalErrorLimit = "internal_error_limit"
 	StopReasonStoreError         = "store_error"
 	StopReasonUnknownStreak      = "unknown_streak"
+	StopReasonAuthExpired        = "auth_expired"
 )
 
 // unknownStreakLimit trips the unknown-streak breaker: N consecutive
@@ -105,6 +106,15 @@ type UnknownStreakStop struct {
 	Batches         int            `json:"batches"`
 	ReasonCounts    map[string]int `json:"reason_counts"`
 	TranscriptPaths []string       `json:"transcript_paths"`
+}
+
+// ProviderAuthStop captures the transcript evidence for an immediate provider
+// authentication stop. Authentication failures do not wait for the ordinary
+// all-unknown streak because every subsequent provider turn would fail until
+// the operator re-authenticates.
+type ProviderAuthStop struct {
+	Reason          string   `json:"reason"`
+	TranscriptPaths []string `json:"transcript_paths"`
 }
 
 type FlushResult struct {
@@ -168,6 +178,7 @@ type CoordinatorStatus struct {
 	LastError          *BatchError         `json:"last_error"`
 	UnknownByReason    map[string]int      `json:"unknown_by_reason,omitempty"`
 	UnknownStreak      *UnknownStreakStop  `json:"unknown_streak,omitempty"`
+	ProviderAuth       *ProviderAuthStop   `json:"provider_auth,omitempty"`
 	// Batch capacity limits (the source of truth for how large a single
 	// ingested event may be). A producer of events (e.g. autopilot's wiki
 	// ingest) must size each event well below MaxTokensPerBatch so that
@@ -216,6 +227,7 @@ type BatchCoordinator struct {
 	writeFailCounts   map[string]int
 	deferredSet       map[string]bool
 	unknownStreakStop *UnknownStreakStop
+	providerAuthStop  *ProviderAuthStop
 	// Cross-flush unknown-streak state (process-local per the ephemeral
 	// declaration). Flush boundaries do NOT reset the streak: under trickle
 	// load a flush may contain only 1-2 batches and a flush-local counter
@@ -274,15 +286,16 @@ func newBatchCoordinator(backend batchIngestBackend, store pendingEventStore, in
 }
 
 // NotifyNewEvent is the /remember-side explicit recovery point: it clears a
-// suspension AND its unknown_streak stop record (the evidence belongs to the
-// cleared trip). This covers the sub-threshold path where the subsequent
-// flush arrives via the timer (flushAuto) — recovery must not depend on the
-// threshold branch selecting an explicit flush.
+// suspension and its stop evidence (unknown streak or provider auth failure).
+// This covers the sub-threshold path where the subsequent flush arrives via
+// the timer (flushAuto) — recovery must not depend on the threshold branch
+// selecting an explicit flush.
 func (coordinator *BatchCoordinator) NotifyNewEvent(eventID string) {
 	coordinator.store.NotifyAppended(eventID)
 	coordinator.mu.Lock()
 	coordinator.suspended = false
 	coordinator.unknownStreakStop = nil
+	coordinator.providerAuthStop = nil
 	coordinator.mu.Unlock()
 	coordinator.signalPending()
 }
@@ -316,6 +329,7 @@ func (coordinator *BatchCoordinator) ResetEvent(eventID string) (AdminResult, er
 	coordinator.store.NotifyAppended(eventID)
 	coordinator.suspended = false
 	coordinator.unknownStreakStop = nil
+	coordinator.providerAuthStop = nil
 	coordinator.signalPending()
 	return AdminResult{EventID: eventID, OldStatus: status.Status, NewStatus: "pending"}, nil
 }
@@ -433,7 +447,7 @@ func (coordinator *BatchCoordinator) scheduleNext(result FlushResult, timer *tim
 	coordinator.lastResult = &resultCopy
 	coordinator.lastFlushAt = time.Now().UTC()
 	deferredCount := len(coordinator.deferredSet)
-	if result.StoppedReason == StopReasonInternalErrorLimit || result.StoppedReason == StopReasonStoreError || result.StoppedReason == StopReasonUnknownStreak {
+	if result.StoppedReason == StopReasonInternalErrorLimit || result.StoppedReason == StopReasonStoreError || result.StoppedReason == StopReasonUnknownStreak || result.StoppedReason == StopReasonAuthExpired {
 		coordinator.suspended = true
 	}
 	suspended := coordinator.suspended
@@ -460,8 +474,8 @@ func (coordinator *BatchCoordinator) scheduleNext(result FlushResult, timer *tim
 }
 
 // Flush triggers. Explicit triggers (/remember, admin retry — anything
-// arriving via the pending channel) clear a suspension and its unknown_streak
-// evidence; auto triggers (timer/threshold) never do — while suspended, an
+// arriving via the pending channel) clear a suspension and its stop evidence;
+// auto triggers (timer/threshold) never do — while suspended, an
 // auto flush is a no-op so the stop record survives until an operator acts
 // (auto-flush should not fire while suspended at all; this guards future
 // bypasses).
@@ -480,6 +494,7 @@ func (coordinator *BatchCoordinator) flush(explicit bool) FlushResult {
 	coordinator.suspended = false
 	if explicit {
 		coordinator.unknownStreakStop = nil
+		coordinator.providerAuthStop = nil
 	}
 	coordinator.mu.Unlock()
 
@@ -583,8 +598,8 @@ func (coordinator *BatchCoordinator) flush(explicit bool) FlushResult {
 				}
 			}
 			coordinator.emitProgress(batch, batchResult, index+1, len(batches), "completed")
-			if tripped := coordinator.recordBatchOutcomes(batch.ID, batchResult, adjudicated, batchUnknown); tripped {
-				result.StoppedReason = StopReasonUnknownStreak
+			if stopReason := coordinator.recordBatchOutcomes(batch.ID, batchResult, adjudicated, batchUnknown); stopReason != "" {
+				result.StoppedReason = stopReason
 				result.EventsRemaining = coordinator.safeRemainingCount()
 				return result
 			}
@@ -655,17 +670,40 @@ func (coordinator *BatchCoordinator) batchTimeout(batch Batch) time.Duration {
 // nor unknown outcomes (structurally unreachable today) leaves it unchanged.
 // The counter survives a trip (probe semantics): after /remember or admin
 // retry clears the suspension, one further all-unknown batch re-trips.
-func (coordinator *BatchCoordinator) recordBatchOutcomes(batchID string, batchResult BatchResult, adjudicated, batchUnknown int) bool {
+func (coordinator *BatchCoordinator) recordBatchOutcomes(batchID string, batchResult BatchResult, adjudicated, batchUnknown int) string {
 	coordinator.mu.Lock()
 	defer coordinator.mu.Unlock()
+	authExpired := 0
+	var authTranscripts []string
+	for _, eventResult := range batchResult.EventResults {
+		if eventResult.Status != "unknown" || eventResult.Reason != UnknownReasonAuthExpired {
+			continue
+		}
+		authExpired++
+		if eventResult.TranscriptPath != "" && len(authTranscripts) == 0 {
+			authTranscripts = append(authTranscripts, eventResult.TranscriptPath)
+		}
+	}
+	if authExpired > 0 {
+		coordinator.suspended = true
+		coordinator.providerAuthStop = &ProviderAuthStop{
+			Reason: UnknownReasonAuthExpired, TranscriptPaths: authTranscripts,
+		}
+		coordinator.lastError = &BatchError{
+			BatchID: batchID, ErrorClass: StopReasonAuthExpired,
+			Message:   "provider OAuth token expired; re-authenticate before resetting unknown events",
+			Timestamp: time.Now().UTC(),
+		}
+		return StopReasonAuthExpired
+	}
 	if adjudicated > 0 {
 		coordinator.unknownStreak = 0
 		coordinator.unknownStreakReasons = make(map[string]int)
 		coordinator.unknownStreakTranscripts = nil
-		return false
+		return ""
 	}
 	if batchUnknown == 0 {
-		return false
+		return ""
 	}
 	coordinator.unknownStreak++
 	for _, eventResult := range batchResult.EventResults {
@@ -682,7 +720,7 @@ func (coordinator *BatchCoordinator) recordBatchOutcomes(batchID string, batchRe
 		}
 	}
 	if coordinator.unknownStreak < unknownStreakLimit {
-		return false
+		return ""
 	}
 	coordinator.suspended = true
 	coordinator.unknownStreakStop = &UnknownStreakStop{
@@ -695,7 +733,7 @@ func (coordinator *BatchCoordinator) recordBatchOutcomes(batchID string, batchRe
 		Message:   fmt.Sprintf("%d consecutive all-unknown batches; see unknown_streak in status", coordinator.unknownStreak),
 		Timestamp: time.Now().UTC(),
 	}
-	return true
+	return StopReasonUnknownStreak
 }
 
 func copyReasonCounts(counts map[string]int) map[string]int {
@@ -958,6 +996,7 @@ func (coordinator *BatchCoordinator) Status() CoordinatorStatus {
 		ActionableFailures: counts.Failed + counts.Unknown, DeferredEvents: len(deferredIDs), DeferredIDs: deferredIDs,
 		IndexStale: coordinator.indexStale, CurrentBatch: currentBatch, Suspended: coordinator.suspended,
 		UnknownByReason: coordinator.store.UnknownByReason(), UnknownStreak: coordinator.unknownStreakStop,
+		ProviderAuth:      coordinator.providerAuthStop,
 		MaxTokensPerBatch: coordinator.limits.MaxTokensPerBatch,
 		MaxEventsPerBatch: coordinator.limits.MaxEventsPerBatch,
 		MaxBytesPerBatch:  coordinator.limits.MaxBytesPerBatch,

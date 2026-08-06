@@ -83,6 +83,31 @@ func TestACPBackendRunBatchIngestClassifiesProcessFailure(t *testing.T) {
 	require.Equal(t, "crash", result.errorClass())
 }
 
+func TestACPBackendRunBatchIngestClassifiesObservedOAuthExpiry(t *testing.T) {
+	backend := newScriptedACPBackend(t, `
+read initialize
+echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
+read initialized
+read session
+echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"session"}}'
+read prompt
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"text":"Let me write these pages.\nFailed to authenticate. API Error: 401 {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"OAuth access token has expired. Re-authenticate to continue.\"}}"}}'
+`)
+	batch := makeBatch([]PendingEvent{{ID: "a"}, {ID: "b"}, {ID: "c"}, {ID: "d"}}, 0)
+
+	result, err := backend.RunBatchIngest(context.Background(), batch, &sync.Mutex{}, func() error { return nil })
+
+	require.NoError(t, err)
+	require.Equal(t, "success", result.Status)
+	require.Len(t, result.EventResults, 4)
+	for _, eventResult := range result.EventResults {
+		require.Equal(t, "unknown", eventResult.Status)
+		require.Equal(t, UnknownReasonAuthExpired, eventResult.Reason)
+		require.NotEmpty(t, eventResult.TranscriptPath)
+		require.FileExists(t, eventResult.TranscriptPath)
+	}
+}
+
 func TestACPBackendRunBatchIngestRejectsMissingPromptCompletion(t *testing.T) {
 	backend := newScriptedACPBackend(t, `
 read initialize
